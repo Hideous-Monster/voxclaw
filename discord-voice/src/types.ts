@@ -33,6 +33,8 @@ export interface DiscordVoiceConfig {
   sessionKey: string;
   /** Agent ID to route completions to (e.g. "voice" for a faster model) */
   agentId: string;
+  /** Model to use for completions (e.g. "anthropic/claude-sonnet-4-6"). Falls back to Sonnet 4.6. */
+  model?: string;
 
   stt: {
     provider: "openai";

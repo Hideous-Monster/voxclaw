@@ -41,7 +41,7 @@ export async function sendToAgent(
         "x-openclaw-session-key": config.sessionKey,
       },
       body: JSON.stringify({
-        model: `openclaw:${config.agentId}`,
+        model: config.model ?? "anthropic/claude-sonnet-4-6",
         stream: false,
         messages: [{ role: "user", content: transcript }],
       }),
