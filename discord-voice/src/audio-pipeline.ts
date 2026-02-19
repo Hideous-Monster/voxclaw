@@ -1,16 +1,15 @@
 /**
  * Audio Pipeline — The Conductor
  *
- * Wires together STT → completions → TTS → playback.
- * One utterance at a time, sequential. No interruption in Phase 1.
+ * Wires STT → completions → TTS → playback. Sequential, one utterance
+ * at a time. If Lemon speaks while Carla is responding, the new utterance
+ * queues and plays after the current response finishes.
  *
- * Flow:
- *   1. Receive PCM buffer from voice-manager (one utterance)
- *   2. Transcribe via Whisper
- *   3. Send to OpenClaw for Carla's response
- *   4. Synthesise response audio
- *   5. Play back in the voice channel
- *   6. Profit
+ * Phase 2 adds interruption: Lemon speaks → current playback stops →
+ * new utterance is processed immediately.
+ *
+ * The pipeline owns the OpenAI client (shared between STT and TTS)
+ * and the Discord AudioPlayer. Everything else is stateless functions.
  */
 
 import {
@@ -21,21 +20,16 @@ import {
   createAudioPlayer,
   createAudioResource,
 } from "@discordjs/voice";
+import OpenAI from "openai";
 import { Readable } from "stream";
 import { transcribe } from "./stt.js";
 import { sendToAgent } from "./completions.js";
 import { synthesise } from "./tts.js";
-import { DiscordVoiceConfig } from "./types.js";
-
-export type Logger = {
-  info: (msg: string, ...args: any[]) => void;
-  warn: (msg: string, ...args: any[]) => void;
-  error: (msg: string, ...args: any[]) => void;
-  debug: (msg: string, ...args: any[]) => void;
-};
+import { DiscordVoiceConfig, Logger } from "./types.js";
 
 export class AudioPipeline {
   private player: AudioPlayer;
+  private openai: OpenAI;
   private processing = false;
   private queue: Buffer[] = [];
 
@@ -43,23 +37,32 @@ export class AudioPipeline {
     private config: DiscordVoiceConfig,
     private log: Logger
   ) {
+    // Single OpenAI client shared between STT and TTS — same API key,
+    // no reason to create two connections.
+    this.openai = new OpenAI({
+      apiKey: config.stt.apiKey ?? config.tts.apiKey ?? process.env.OPENAI_API_KEY,
+    });
+
     this.player = createAudioPlayer();
 
     this.player.on("error", (err) => {
       this.log.error("[discord-voice] Audio player error:", err.message);
     });
 
-    // When playback finishes, process the next item in the queue
     this.player.on(AudioPlayerStatus.Idle, () => {
       this.processNext();
     });
   }
 
+  /** The AudioPlayer that should be subscribed to the voice connection */
   getPlayer(): AudioPlayer {
     return this.player;
   }
 
-  /** Queue a PCM buffer for processing */
+  /**
+   * Queue a PCM buffer (one complete utterance) for processing.
+   * If the pipeline is idle, processing starts immediately.
+   */
   enqueue(pcmBuffer: Buffer): void {
     this.queue.push(pcmBuffer);
     if (!this.processing) {
@@ -77,9 +80,9 @@ export class AudioPipeline {
     this.processing = true;
 
     try {
-      // Step 1: Transcribe
-      this.log.debug("[discord-voice] Transcribing audio...");
-      const transcript = await transcribe(pcmBuffer, this.config);
+      // ── Step 1: Speech → Text ─────────────────────────────────
+      this.log.debug("[discord-voice] Transcribing...");
+      const transcript = await transcribe(pcmBuffer, this.config, this.openai, this.log);
 
       if (!transcript) {
         this.log.debug("[discord-voice] Empty transcript, skipping");
@@ -88,41 +91,38 @@ export class AudioPipeline {
         return;
       }
 
-      this.log.info(`[discord-voice] Transcript: "${transcript}"`);
+      this.log.info(`[discord-voice] 🎤 "${transcript}"`);
 
-      // Step 2: Ask Carla
-      this.log.debug("[discord-voice] Sending to OpenClaw...");
+      // ── Step 2: Text → Carla ──────────────────────────────────
+      this.log.debug("[discord-voice] Thinking...");
       const { text: response } = await sendToAgent(transcript, this.config);
 
-      this.log.info(`[discord-voice] Response: "${response.slice(0, 100)}..."`);
+      // Log a preview, not the full response (can be long)
+      const preview = response.length > 120 ? response.slice(0, 120) + "…" : response;
+      this.log.info(`[discord-voice] 🗣️ "${preview}"`);
 
-      // Step 3: Synthesise speech
-      this.log.debug("[discord-voice] Synthesising TTS...");
-      const audioBuffer = await synthesise(response, this.config);
+      // ── Step 3: Carla → Voice ─────────────────────────────────
+      this.log.debug("[discord-voice] Synthesising...");
+      const mp3Buffer = await synthesise(response, this.config, this.openai, this.log);
 
-      // Step 4: Play it back
-      const resource = this.createResource(audioBuffer);
+      // ── Step 4: Play ──────────────────────────────────────────
+      const resource = createAudioResource(Readable.from(mp3Buffer), {
+        inputType: StreamType.Arbitrary,
+      });
       this.player.play(resource);
-      // Pipeline continues when player emits Idle (see constructor)
+      // Pipeline resumes when player emits Idle → processNext()
 
     } catch (err: any) {
       this.log.error("[discord-voice] Pipeline error:", err?.message ?? err);
       this.processing = false;
-      // Don't get stuck — keep processing the queue
-      setTimeout(() => this.processNext(), 500);
+      // Brief pause before retrying the queue (don't tight-loop on errors)
+      setTimeout(() => this.processNext(), 1000);
     }
   }
 
-  private createResource(mp3Buffer: Buffer): AudioResource {
-    const stream = Readable.from(mp3Buffer);
-    return createAudioResource(stream, {
-      inputType: StreamType.Arbitrary, // Let @discordjs/voice probe the format
-    });
-  }
-
-  /** Stop everything and clear the queue */
+  /** Hard stop: kill playback, drop the queue, reset state */
   stop(): void {
-    this.queue = [];
+    this.queue.length = 0;
     this.processing = false;
     this.player.stop(true);
   }

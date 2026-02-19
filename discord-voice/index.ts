@@ -1,89 +1,78 @@
 /**
  * Discord Voice Plugin for OpenClaw
  *
- * Carla, but in your Discord voice channel. Hands-free conversations
- * for the commute, the workshop, the beach walk — whatever you're doing
- * that's more important than sitting at a keyboard.
+ * Hands-free voice conversations with Carla in a Discord voice channel.
+ * Join the channel, start talking. She listens, thinks, and talks back.
  *
- * Phase 1: Basic voice loop (STT → completions → TTS)
+ * Phase 1: Whisper STT → OpenClaw → OpenAI TTS (this)
  * Phase 2: ElevenLabs TTS, VAD interruption, audio cues
  * Phase 3: Wake words, conversation summaries, multi-user
  *
- * @see /workspace/plans/discord-voice-plugin.md
  * @see https://github.com/Hideous-Monster/voxclaw/issues/4
  */
 
-import { DiscordVoiceConfig, OpenClawPluginApi, CONFIG_DEFAULTS } from "./src/types.js";
+import { DiscordVoiceConfig, OpenClawPluginApi, CONFIG_DEFAULTS, Logger } from "./src/types.js";
 import { VoiceManager } from "./src/voice-manager.js";
 
-export default function register(api: OpenClawPluginApi): void {
-  const rawConfig = api.config?.plugins?.entries?.["discord-voice"]?.config;
-
-  // Merge defaults with user config
-  const config: DiscordVoiceConfig = {
-    ...CONFIG_DEFAULTS,
-    ...rawConfig,
-    stt: { ...CONFIG_DEFAULTS.stt, ...rawConfig?.stt },
-    tts: { ...CONFIG_DEFAULTS.tts, ...rawConfig?.tts },
-    vad: { ...CONFIG_DEFAULTS.vad, ...rawConfig?.vad },
-  } as DiscordVoiceConfig;
-
-  // Build a logger — use the plugin API's logger if available, fall back to console
-  const log = {
-    info: (msg: string, ...args: any[]) =>
-      api.logger?.info(msg, ...args) ?? console.info(msg, ...args),
-    warn: (msg: string, ...args: any[]) =>
-      api.logger?.warn(msg, ...args) ?? console.warn(msg, ...args),
-    error: (msg: string, ...args: any[]) =>
-      api.logger?.error(msg, ...args) ?? console.error(msg, ...args),
-    debug: (msg: string, ...args: any[]) =>
-      api.logger?.debug(msg, ...args) ?? console.debug(msg, ...args),
+function buildLogger(api: OpenClawPluginApi): Logger {
+  return {
+    info: (msg, ...args) => (api.logger?.info ?? console.info)(msg, ...args),
+    warn: (msg, ...args) => (api.logger?.warn ?? console.warn)(msg, ...args),
+    error: (msg, ...args) => (api.logger?.error ?? console.error)(msg, ...args),
+    debug: (msg, ...args) => (api.logger?.debug ?? console.debug)(msg, ...args),
   };
+}
 
-  // Resolve the Discord bot token:
-  // 1. From our own plugin config (if a separate bot is configured)
-  // 2. From the main Discord channel config (share the existing bot)
-  // 3. From the DISCORD_BOT_TOKEN env var
+function resolveConfig(raw: Partial<DiscordVoiceConfig> | undefined): DiscordVoiceConfig {
+  return {
+    ...CONFIG_DEFAULTS,
+    ...raw,
+    stt: { ...CONFIG_DEFAULTS.stt, ...raw?.stt },
+    tts: { ...CONFIG_DEFAULTS.tts, ...raw?.tts },
+    vad: { ...CONFIG_DEFAULTS.vad, ...raw?.vad },
+  } as DiscordVoiceConfig;
+}
+
+export default function register(api: OpenClawPluginApi): void {
+  const log = buildLogger(api);
+  const rawConfig = api.config?.plugins?.entries?.["discord-voice"]?.config;
+  const config = resolveConfig(rawConfig);
+
+  // ── Resolve Discord bot token ─────────────────────────────────
+  // Prefer explicit plugin config, fall back to OpenClaw's Discord
+  // channel token, then env var. We document this precedence in the
+  // README so nobody is surprised.
   const botToken =
     (rawConfig as any)?.botToken ??
     api.config?.channels?.discord?.token ??
     process.env.DISCORD_BOT_TOKEN;
 
-  if (!botToken) {
+  // ── Validate required config ──────────────────────────────────
+  const missing: string[] = [];
+  if (!botToken) missing.push("Discord bot token (channels.discord.token or DISCORD_BOT_TOKEN)");
+  if (!config.watchUserId) missing.push("watchUserId");
+  if (!config.voiceChannelId) missing.push("voiceChannelId");
+  if (!config.gatewayUrl) missing.push("gatewayUrl");
+  if (!config.gatewayToken) missing.push("gatewayToken");
+
+  if (missing.length > 0) {
     log.error(
-      "[discord-voice] No Discord bot token found. " +
-        "Set channels.discord.token in openclaw.json or DISCORD_BOT_TOKEN env var."
+      `[discord-voice] Missing required config: ${missing.join(", ")}. ` +
+        "Plugin will not start."
     );
     return;
   }
 
-  if (!config.watchUserId || !config.voiceChannelId) {
-    log.warn(
-      "[discord-voice] watchUserId and voiceChannelId are required. " +
-        "Plugin will not start until they are configured."
-    );
-    return;
-  }
+  // ── Start ─────────────────────────────────────────────────────
+  const manager = new VoiceManager(config, botToken!, log);
 
-  if (!config.gatewayUrl || !config.gatewayToken) {
-    log.error(
-      "[discord-voice] gatewayUrl and gatewayToken are required. " +
-        "Point them at your OpenClaw gateway."
-    );
-    return;
-  }
-
-  const manager = new VoiceManager(config, botToken, log);
-
-  // Register a gateway RPC method so we can poke the plugin manually if needed
+  // Gateway RPC methods for manual control
   api.registerGatewayMethod("discord-voice.status", () => ({
     running: true,
-    config: {
-      watchUserId: config.watchUserId,
-      voiceChannelId: config.voiceChannelId,
-      agentId: config.agentId,
-      sessionKey: config.sessionKey,
-    },
+    watchUserId: config.watchUserId,
+    voiceChannelId: config.voiceChannelId,
+    agentId: config.agentId,
+    sessionKey: config.sessionKey,
   }));
 
   api.registerGatewayMethod("discord-voice.stop", async () => {
@@ -91,9 +80,8 @@ export default function register(api: OpenClawPluginApi): void {
     return { stopped: true };
   });
 
-  // 🚀 Blast off
-  log.info("[discord-voice] Starting Discord voice plugin...");
+  log.info("[discord-voice] Starting voice plugin...");
   manager.start().catch((err) => {
-    log.error("[discord-voice] Failed to start voice manager:", err?.message ?? err);
+    log.error("[discord-voice] Failed to start:", err?.message ?? err);
   });
 }

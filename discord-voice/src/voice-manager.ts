@@ -1,16 +1,23 @@
 /**
  * Voice Manager — The Bouncer
  *
- * Watches a Discord voice channel. When the target user (Lemon) shows up,
- * we join. When they leave, we leave. Simple as.
+ * Watches for a target user in a Discord voice channel. When they join,
+ * we follow. When they leave, we leave. When they speak, we listen.
  *
- * Also handles the actual audio capture: subscribes to the user's audio
- * stream, collects Opus packets, decodes them to PCM, and hands off
- * complete utterances to the AudioPipeline.
+ * IMPORTANT: This creates its own Discord.js Client. The stock OpenClaw
+ * Discord channel also runs a Client with the same bot token. Discord
+ * allows multiple gateway connections per bot (up to the shard limit),
+ * so this works — but the voice manager only cares about voice states
+ * and doesn't handle text messages (that's OpenClaw's job).
+ *
+ * If OpenClaw's plugin API ever exposes the existing Discord client,
+ * we should switch to that. For now, a second connection is the only
+ * way to get voice support without forking core.
  */
 
 import {
   Client,
+  Events,
   GatewayIntentBits,
   VoiceChannel,
   VoiceState,
@@ -24,166 +31,196 @@ import {
   joinVoiceChannel,
 } from "@discordjs/voice";
 import { OpusEncoder } from "@discordjs/opus";
-import { DiscordVoiceConfig } from "./types.js";
-import { AudioPipeline, Logger } from "./audio-pipeline.js";
+import { DiscordVoiceConfig, Logger } from "./types.js";
+import { AudioPipeline } from "./audio-pipeline.js";
+
+// Discord voice: 48kHz stereo 16-bit
+const BYTES_PER_SECOND = 48_000 * 2 * 2;
 
 export class VoiceManager {
-  private client: Client | null = null;
+  private client: Client;
   private connection: VoiceConnection | null = null;
   private pipeline: AudioPipeline | null = null;
   private guildId: string | null = null;
+  private listening = false;
 
   constructor(
     private config: DiscordVoiceConfig,
     private botToken: string,
     private log: Logger
-  ) {}
-
-  async start(): Promise<void> {
+  ) {
     this.client = new Client({
       intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.GuildMessages,
       ],
     });
+  }
 
-    this.client.on("ready", () => {
-      this.log.info(`[discord-voice] Bot ready as ${this.client!.user?.tag}`);
+  async start(): Promise<void> {
+    this.client.once(Events.ClientReady, (c) => {
+      this.log.info(`[discord-voice] Connected as ${c.user.tag}`);
+      this.checkIfUserAlreadyInChannel();
     });
 
-    this.client.on("voiceStateUpdate", (oldState, newState) => {
-      this.handleVoiceStateUpdate(oldState, newState);
+    this.client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+      this.onVoiceStateUpdate(oldState, newState);
+    });
+
+    this.client.on(Events.Error, (err) => {
+      this.log.error("[discord-voice] Discord client error:", err.message);
     });
 
     await this.client.login(this.botToken);
   }
 
   async stop(): Promise<void> {
-    this.pipeline?.stop();
-    this.connection?.destroy();
-    this.client?.destroy();
+    this.leaveChannel();
+    this.client.destroy();
+    this.log.info("[discord-voice] Voice manager stopped");
   }
 
-  private handleVoiceStateUpdate(oldState: VoiceState, newState: VoiceState): void {
-    if (newState.member?.id !== this.config.watchUserId) return;
+  // ── Voice state tracking ────────────────────────────────────────
 
-    const joinedChannel = !oldState.channelId && newState.channelId;
-    const leftChannel = oldState.channelId && !newState.channelId;
-    const changedChannel = oldState.channelId !== newState.channelId && newState.channelId;
+  /**
+   * On startup, check if the watched user is already in the voice channel.
+   * Handles the case where the bot restarts while someone is in a call.
+   */
+  private async checkIfUserAlreadyInChannel(): Promise<void> {
+    if (!this.config.autoJoin) return;
 
-    if (
-      this.config.autoJoin &&
-      (joinedChannel || changedChannel) &&
-      newState.channelId === this.config.voiceChannelId
-    ) {
-      this.log.info(
-        `[discord-voice] ${newState.member?.displayName} joined voice — joining channel`
-      );
+    try {
+      const channel = await this.client.channels.fetch(this.config.voiceChannelId);
+      if (!channel?.isVoiceBased()) return;
+
+      const voiceChannel = channel as VoiceChannel;
+      const member = voiceChannel.members.get(this.config.watchUserId);
+      if (member) {
+        this.log.info("[discord-voice] User already in voice channel on startup — joining");
+        await this.joinChannel(voiceChannel);
+      }
+    } catch (err: any) {
+      this.log.warn("[discord-voice] Could not check initial voice state:", err?.message);
+    }
+  }
+
+  private onVoiceStateUpdate(oldState: VoiceState, newState: VoiceState): void {
+    // Only care about the watched user
+    if ((newState.member?.id ?? oldState.member?.id) !== this.config.watchUserId) return;
+    if (!this.config.autoJoin) return;
+
+    const wasInOurChannel = oldState.channelId === this.config.voiceChannelId;
+    const isInOurChannel = newState.channelId === this.config.voiceChannelId;
+
+    if (!wasInOurChannel && isInOurChannel) {
+      // Joined our channel
+      this.log.info(`[discord-voice] ${newState.member?.displayName ?? "User"} joined — following`);
       this.joinChannel(newState.channel as VoiceChannel);
-    } else if (leftChannel || (changedChannel && oldState.channelId === this.config.voiceChannelId)) {
-      this.log.info(
-        `[discord-voice] ${newState.member?.displayName} left voice — leaving channel`
-      );
+    } else if (wasInOurChannel && !isInOurChannel) {
+      // Left our channel (or moved to a different one)
+      this.log.info(`[discord-voice] ${oldState.member?.displayName ?? "User"} left — leaving`);
       this.leaveChannel();
     }
   }
 
+  // ── Voice connection ────────────────────────────────────────────
+
   private async joinChannel(channel: VoiceChannel): Promise<void> {
     if (!channel.guild) return;
 
-    this.guildId = channel.guild.id;
-
-    // If we're already connected, no need to re-join
-    const existing = getVoiceConnection(channel.guild.id);
-    if (existing) {
+    // Already connected?
+    if (getVoiceConnection(channel.guild.id)) {
       this.log.debug("[discord-voice] Already in voice channel");
       return;
     }
+
+    this.guildId = channel.guild.id;
+    this.pipeline = new AudioPipeline(this.config, this.log);
 
     this.connection = joinVoiceChannel({
       channelId: channel.id,
       guildId: channel.guild.id,
       adapterCreator: channel.guild.voiceAdapterCreator,
-      selfDeaf: false, // We need to hear Lemon
+      selfDeaf: false, // We need to hear
       selfMute: false,
     });
 
-    this.pipeline = new AudioPipeline(this.config, this.log);
     this.connection.subscribe(this.pipeline.getPlayer());
 
     try {
-      await entersState(this.connection, VoiceConnectionStatus.Ready, 10_000);
-      this.log.info("[discord-voice] Connected to voice channel");
+      await entersState(this.connection, VoiceConnectionStatus.Ready, 15_000);
+      this.log.info("[discord-voice] Voice connection ready");
       this.startListening();
-    } catch (err) {
-      this.log.error("[discord-voice] Failed to connect to voice channel:", err);
-      this.connection.destroy();
-      this.connection = null;
+    } catch (err: any) {
+      this.log.error("[discord-voice] Failed to join voice channel:", err?.message);
+      this.leaveChannel();
     }
   }
 
   private leaveChannel(): void {
+    this.listening = false;
     this.pipeline?.stop();
     this.pipeline = null;
 
     if (this.guildId) {
-      const conn = getVoiceConnection(this.guildId);
-      conn?.destroy();
+      getVoiceConnection(this.guildId)?.destroy();
     }
 
     this.connection = null;
     this.guildId = null;
-    this.log.info("[discord-voice] Left voice channel");
   }
 
+  // ── Audio capture ───────────────────────────────────────────────
+
   private startListening(): void {
-    if (!this.connection || !this.pipeline) return;
+    if (!this.connection || !this.pipeline || this.listening) return;
+    this.listening = true;
 
     const receiver = this.connection.receiver;
+    const decoder = new OpusEncoder(48_000, 2);
+    const maxBytes = this.config.vad.maxUtteranceSec * BYTES_PER_SECOND;
 
-    // Listen for Lemon speaking
+    // The speaking event fires once per utterance start. We subscribe to
+    // the audio stream with AfterSilence end behavior — Discord handles
+    // the silence detection for us.
     receiver.speaking.on("start", (userId) => {
       if (userId !== this.config.watchUserId) return;
 
-      this.log.debug("[discord-voice] Speech started, subscribing to audio stream");
+      this.log.debug("[discord-voice] Speech detected, capturing");
 
-      const audioStream = receiver.subscribe(userId, {
+      const stream = receiver.subscribe(userId, {
         end: {
           behavior: EndBehaviorType.AfterSilence,
           duration: this.config.vad.silenceThresholdMs,
         },
       });
 
-      // Opus packets from Discord — 48kHz stereo
-      const encoder = new OpusEncoder(48000, 2);
-      const pcmChunks: Buffer[] = [];
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
 
-      audioStream.on("data", (opusPacket: Buffer) => {
+      stream.on("data", (packet: Buffer) => {
+        // Safety cap: don't buffer more than maxUtteranceSec of audio
+        if (totalBytes >= maxBytes) return;
+
         try {
-          // Decode Opus → raw PCM (16-bit signed LE, interleaved stereo)
-          const pcm = encoder.decode(opusPacket);
-          pcmChunks.push(pcm);
-        } catch (err: any) {
-          this.log.debug("[discord-voice] Opus decode error (likely silence packet):", err?.message);
+          const pcm = decoder.decode(packet);
+          chunks.push(pcm);
+          totalBytes += pcm.length;
+        } catch {
+          // Opus decode can fail on silence/comfort-noise packets — ignore
         }
       });
 
-      audioStream.on("end", () => {
-        if (pcmChunks.length === 0 || !this.pipeline) return;
+      stream.once("end", () => {
+        if (chunks.length === 0 || !this.pipeline) return;
 
-        const pcmBuffer = Buffer.concat(pcmChunks);
-        this.log.debug(
-          `[discord-voice] Utterance complete: ${pcmBuffer.length} bytes PCM (~${
-            Math.round(pcmBuffer.length / 48000 / 2 / 2 * 100) / 100
-          }s)`
-        );
-
-        // Hand off to the pipeline — it handles the rest
-        this.pipeline.enqueue(pcmBuffer);
+        const pcm = Buffer.concat(chunks);
+        const durationSec = (pcm.length / BYTES_PER_SECOND).toFixed(1);
+        this.log.debug(`[discord-voice] Utterance: ${durationSec}s (${pcm.length} bytes)`);
+        this.pipeline.enqueue(pcm);
       });
 
-      audioStream.on("error", (err) => {
+      stream.once("error", (err) => {
         this.log.error("[discord-voice] Audio stream error:", err.message);
       });
     });

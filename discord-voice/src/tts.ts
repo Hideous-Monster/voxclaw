@@ -1,55 +1,53 @@
 /**
  * Text-to-Speech — Carla's Voice
  *
- * Phase 1: OpenAI TTS (gpt-4o-mini-tts) — fast, cheap, decent quality.
- * Phase 2: ElevenLabs — better voice, more Carla-like. Charlotte (British)
- *   or a custom voice. Worth the extra cost for daily driving sessions.
+ * Phase 1: OpenAI TTS (gpt-4o-mini-tts). Fast, cheap, decent quality.
+ * Phase 2: ElevenLabs. Better voice, more personality — worth the premium
+ *   for daily driving sessions. Charlotte with a leather jacket attitude.
  *
- * Returns a Buffer of MP3 audio that can be streamed into a Discord
- * AudioResource via Readable.from().
+ * Returns an MP3 buffer ready to be wrapped in a Discord AudioResource.
  */
 
 import OpenAI from "openai";
-import { DiscordVoiceConfig } from "./types.js";
+import { DiscordVoiceConfig, Logger } from "./types.js";
 
-let openaiClient: OpenAI | null = null;
-
-function getClient(config: DiscordVoiceConfig): OpenAI {
-  if (!openaiClient) {
-    openaiClient = new OpenAI({
-      apiKey: config.tts.apiKey ?? process.env.OPENAI_API_KEY,
-    });
-  }
-  return openaiClient;
-}
+/** OpenAI TTS has a 4096 character limit per request */
+const OPENAI_TTS_MAX_CHARS = 4096;
 
 /**
- * Synthesise text to MP3 audio using OpenAI TTS.
- * Returns the raw MP3 buffer.
+ * Synthesise text to an MP3 buffer.
+ * Throws if the provider is unsupported or the API call fails.
  */
 export async function synthesise(
   text: string,
-  config: DiscordVoiceConfig
+  config: DiscordVoiceConfig,
+  client: OpenAI,
+  log: Logger
 ): Promise<Buffer> {
   if (config.tts.provider === "elevenlabs") {
-    // Phase 2: ElevenLabs integration
-    // For now, fall through to OpenAI even if misconfigured
-    // TODO: implement ElevenLabs TTS
     throw new Error(
-      "ElevenLabs TTS not yet implemented — coming in Phase 2. Use provider: 'openai' for now."
+      "ElevenLabs TTS is Phase 2. Set tts.provider to 'openai' for now."
     );
   }
 
-  const client = getClient(config);
+  // Truncate if needed — OpenAI TTS has a hard character limit.
+  // For voice responses this shouldn't happen often (the voice agent
+  // should be concise), but better truncated than crashed.
+  let input = text;
+  if (input.length > OPENAI_TTS_MAX_CHARS) {
+    log.warn(
+      `[discord-voice] TTS input too long (${input.length} chars), truncating to ${OPENAI_TTS_MAX_CHARS}`
+    );
+    input = input.slice(0, OPENAI_TTS_MAX_CHARS - 3) + "...";
+  }
 
   const response = await client.audio.speech.create({
-    model: config.tts.model as "gpt-4o-mini-tts" | "tts-1" | "tts-1-hd",
-    voice: config.tts.voice as "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer",
-    input: text,
+    model: config.tts.model,
+    voice: config.tts.voice as any,
+    input,
     response_format: "mp3",
   });
 
-  // The SDK returns a Response-like object; we need the raw bytes
   const arrayBuffer = await response.arrayBuffer();
   return Buffer.from(arrayBuffer);
 }
