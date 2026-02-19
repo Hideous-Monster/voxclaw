@@ -1,0 +1,78 @@
+{
+  "id": "discord-voice",
+  "name": "Discord Voice",
+  "version": "0.1.0",
+  "description": "Voice channel support for Discord — talk to Carla hands-free while driving, walking, or building swords.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["gatewayUrl", "gatewayToken"],
+    "properties": {
+      "watchUserId": {
+        "type": "string",
+        "description": "Discord user ID to watch for voice channel presence"
+      },
+      "voiceChannelId": {
+        "type": "string",
+        "description": "Discord voice channel ID to join when watchUserId is present"
+      },
+      "autoJoin": {
+        "type": "boolean",
+        "default": true,
+        "description": "Automatically join the voice channel when watchUserId enters"
+      },
+      "gatewayUrl": {
+        "type": "string",
+        "description": "OpenClaw gateway chat completions URL (e.g. http://localhost:18789)"
+      },
+      "gatewayToken": {
+        "type": "string",
+        "description": "OpenClaw gateway auth token"
+      },
+      "sessionKey": {
+        "type": "string",
+        "default": "voice:lemon",
+        "description": "OpenClaw session key for persistent voice memory"
+      },
+      "agentId": {
+        "type": "string",
+        "default": "voice",
+        "description": "OpenClaw agent ID to use for voice conversations"
+      },
+      "stt": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "provider": { "type": "string", "enum": ["openai"], "default": "openai" },
+          "apiKey": { "type": "string", "description": "OpenAI API key (falls back to OPENAI_API_KEY env)" },
+          "model": { "type": "string", "default": "whisper-1" }
+        }
+      },
+      "tts": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "provider": { "type": "string", "enum": ["openai", "elevenlabs"], "default": "openai" },
+          "apiKey": { "type": "string", "description": "API key (falls back to OPENAI_API_KEY or ELEVENLABS_API_KEY)" },
+          "model": { "type": "string", "default": "gpt-4o-mini-tts" },
+          "voice": { "type": "string", "default": "alloy", "description": "OpenAI voice or ElevenLabs voice ID" },
+          "voiceId": { "type": "string", "description": "ElevenLabs voice ID (Phase 2)" },
+          "modelId": { "type": "string", "description": "ElevenLabs model ID (Phase 2)" }
+        }
+      },
+      "vad": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "silenceThresholdMs": { "type": "number", "default": 800, "description": "Milliseconds of silence before processing speech" },
+          "minSpeechMs": { "type": "number", "default": 200, "description": "Minimum speech duration to process (filters out noise)" }
+        }
+      }
+    }
+  },
+  "uiHints": {
+    "gatewayToken": { "label": "Gateway Token", "sensitive": true },
+    "stt.apiKey": { "label": "OpenAI API Key (STT)", "sensitive": true },
+    "tts.apiKey": { "label": "TTS API Key", "sensitive": true }
+  }
+}
