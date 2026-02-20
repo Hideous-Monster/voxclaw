@@ -35,7 +35,9 @@ function resolveConfig(raw: Partial<DiscordVoiceConfig> | undefined): DiscordVoi
 
 export default function register(api: OpenClawPluginApi): void {
   const log = buildLogger(api);
-  const rawConfig = api.config?.plugins?.entries?.["discord-voice"]?.config;
+  const rawConfig =
+    api.config?.plugins?.entries?.["openclaw-discord-voice"]?.config ??
+    api.config?.plugins?.entries?.["discord-voice"]?.config;
   const config = resolveConfig(rawConfig);
 
   // ── Resolve Discord bot token ─────────────────────────────────

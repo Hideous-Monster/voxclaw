@@ -1,5 +1,5 @@
 {
-  "id": "discord-voice",
+  "id": "openclaw-discord-voice",
   "name": "Discord Voice",
   "version": "0.1.0",
   "description": "Voice channel support for Discord — talk to your OpenClaw hands-free.",
