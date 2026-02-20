@@ -146,6 +146,21 @@ export class AudioPipeline {
         return;
       }
 
+      // Filter out noise: single words, very short utterances, common
+      // Whisper hallucinations on silence/noise
+      const NOISE_PATTERNS = [
+        /^(you|the|a|um|uh|hmm|oh|ah|bye|thank you|thanks)\.?$/i,
+        /^\W+$/, // just punctuation
+      ];
+      const wordCount = transcript.split(/\s+/).length;
+      const isNoise = wordCount <= 2 && NOISE_PATTERNS.some(p => p.test(transcript));
+      if (isNoise) {
+        this.log.debug(`[discord-voice] Filtered noise: "${transcript}"`);
+        this.processing = false;
+        this.processNext();
+        return;
+      }
+
       this.log.info(`[discord-voice] 🎤 "${transcript}"`);
 
       // ── Streaming completions + chunked TTS ───────────────────
