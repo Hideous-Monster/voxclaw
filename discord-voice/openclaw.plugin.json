@@ -59,7 +59,8 @@
           "provider": { "type": "string", "enum": ["openai", "elevenlabs"], "default": "openai" },
           "apiKey": { "type": "string", "description": "TTS API key (falls back to OPENAI_API_KEY or ELEVENLABS_API_KEY)" },
           "model": { "type": "string", "default": "gpt-4o-mini-tts" },
-          "voice": { "type": "string", "default": "alloy" },
+          "voice": { "type": "string", "default": "nova" },
+          "instructions": { "type": "string", "description": "Style instructions for gpt-4o-mini-tts voice delivery" },
           "voiceId": { "type": "string", "description": "ElevenLabs voice ID (Phase 2)" },
           "modelId": { "type": "string", "description": "ElevenLabs model ID (Phase 2)" }
         }
