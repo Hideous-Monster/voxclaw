@@ -137,22 +137,33 @@ export class VoiceManager {
     this.guildId = channel.guild.id;
     this.pipeline = new AudioPipeline(this.config, this.log);
 
-    this.connection = joinVoiceChannel({
-      channelId: channel.id,
-      guildId: channel.guild.id,
-      adapterCreator: channel.guild.voiceAdapterCreator,
-      selfDeaf: false, // We need to hear
-      selfMute: false,
-    });
-
-    this.connection.subscribe(this.pipeline.getPlayer());
+    this.log.info(`[discord-voice] Joining channel ${channel.id} in guild ${channel.guild.id}`);
 
     try {
+      this.connection = joinVoiceChannel({
+        channelId: channel.id,
+        guildId: channel.guild.id,
+        adapterCreator: channel.guild.voiceAdapterCreator,
+        selfDeaf: false,
+        selfMute: false,
+      });
+
+      this.connection.on("stateChange", (oldState, newState) => {
+        this.log.debug(`[discord-voice] Connection state: ${oldState.status} → ${newState.status}`);
+      });
+
+      this.connection.on("error", (err) => {
+        this.log.error(`[discord-voice] Connection error: ${err?.message ?? err}`);
+      });
+
+      this.connection.subscribe(this.pipeline.getPlayer());
+
       await entersState(this.connection, VoiceConnectionStatus.Ready, 15_000);
       this.log.info("[discord-voice] Voice connection ready");
       this.startListening();
     } catch (err: any) {
-      this.log.error("[discord-voice] Failed to join voice channel:", err?.message);
+      this.log.error(`[discord-voice] Failed to join: ${err?.message ?? err} (${typeof err})`);
+      if (err?.stack) this.log.error(`[discord-voice] Stack: ${err.stack}`);
       this.leaveChannel();
     }
   }
@@ -180,11 +191,21 @@ export class VoiceManager {
     const decoder = new OpusEncoder(48_000, 2);
     const maxBytes = this.config.vad.maxUtteranceSec * BYTES_PER_SECOND;
 
-    // The speaking event fires once per utterance start. We subscribe to
-    // the audio stream with AfterSilence end behavior — Discord handles
-    // the silence detection for us.
+    // Track whether we're currently capturing to prevent overlapping subscriptions.
+    // Discord fires "start" multiple times per utterance (e.g. brief pauses between
+    // words). We only create one subscription per continuous speech block.
+    let capturing = false;
+
     receiver.speaking.on("start", (userId) => {
       if (userId !== this.config.watchUserId) return;
+      if (capturing) return; // Already listening, ignore re-fires
+
+      capturing = true;
+
+      // Interrupt: if Carla is currently speaking, shut up immediately
+      if (this.pipeline) {
+        this.pipeline.interrupt();
+      }
 
       this.log.debug("[discord-voice] Speech detected, capturing");
 
@@ -199,7 +220,6 @@ export class VoiceManager {
       let totalBytes = 0;
 
       stream.on("data", (packet: Buffer) => {
-        // Safety cap: don't buffer more than maxUtteranceSec of audio
         if (totalBytes >= maxBytes) return;
 
         try {
@@ -212,6 +232,8 @@ export class VoiceManager {
       });
 
       stream.once("end", () => {
+        capturing = false; // Ready for next utterance
+
         if (chunks.length === 0 || !this.pipeline) return;
 
         const pcm = Buffer.concat(chunks);
@@ -221,6 +243,7 @@ export class VoiceManager {
       });
 
       stream.once("error", (err) => {
+        capturing = false;
         this.log.error("[discord-voice] Audio stream error:", err.message);
       });
     });

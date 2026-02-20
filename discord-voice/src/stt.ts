@@ -69,9 +69,12 @@ export async function transcribe(
   }
 
   const wavBuffer = pcmToWav(pcmBuffer);
-  const file = new File([wavBuffer], "audio.wav", { type: "audio/wav" });
 
   try {
+    // Use toFile helper from OpenAI SDK — more reliable than Node's File API
+    const file = await import("openai").then(m =>
+      m.toFile(wavBuffer, "audio.wav", { type: "audio/wav" })
+    );
     const response = await client.audio.transcriptions.create({
       file,
       model: config.stt.model,
@@ -80,7 +83,7 @@ export async function transcribe(
 
     return response.text.trim();
   } catch (err: any) {
-    log.error("[discord-voice] Whisper transcription failed:", err?.message ?? err);
+    log.error(`[discord-voice] Whisper transcription failed: ${err?.message ?? err} | status: ${err?.status} | code: ${err?.code} | type: ${err?.type} | ${JSON.stringify(err?.error ?? '')}`);
     return "";
   }
 }

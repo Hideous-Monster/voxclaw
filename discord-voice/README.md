@@ -22,7 +22,7 @@ openclaw gateway restart
 Add to `~/.openclaw/openclaw.json` under `plugins.entries`:
 
 ```json
-"discord-voice": {
+"openclaw-discord-voice": {
   "enabled": true,
   "config": {
     "watchUserId": "YOUR_DISCORD_USER_ID",

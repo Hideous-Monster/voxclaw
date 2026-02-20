@@ -33,6 +33,8 @@ export interface DiscordVoiceConfig {
   sessionKey: string;
   /** Agent ID to route completions to (e.g. "voice" for a faster model) */
   agentId: string;
+  /** Model to use for completions (e.g. "anthropic/claude-sonnet-4-6"). Falls back to Sonnet 4.6. */
+  model?: string;
 
   stt: {
     provider: "openai";
@@ -45,6 +47,7 @@ export interface DiscordVoiceConfig {
     apiKey?: string;
     model: string;
     voice: string;
+    instructions?: string;  // Style instructions for gpt-4o-mini-tts
     voiceId?: string;  // ElevenLabs (Phase 2)
     modelId?: string;  // ElevenLabs (Phase 2)
   };
@@ -72,7 +75,8 @@ export const CONFIG_DEFAULTS: Partial<DiscordVoiceConfig> = {
   tts: {
     provider: "openai",
     model: "gpt-4o-mini-tts",
-    voice: "alloy",
+    voice: "nova",
+    instructions: "Speak with a sharp, confident, slightly sardonic tone. You're direct and don't waste words — like a rock musician who happens to be brilliant at engineering. Warm underneath the edge, but never saccharine.",
   },
   vad: {
     silenceThresholdMs: 800,

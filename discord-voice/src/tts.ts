@@ -46,6 +46,7 @@ export async function synthesise(
     voice: config.tts.voice as any,
     input,
     response_format: "mp3",
+    ...(config.tts.instructions && { instructions: config.tts.instructions }),
   });
 
   const arrayBuffer = await response.arrayBuffer();
