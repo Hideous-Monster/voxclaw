@@ -467,7 +467,20 @@ export class VoiceManager {
         if (chunks.length === 0 || !this.pipeline) return;
 
         const pcm = Buffer.concat(chunks);
-        const durationSec = (pcm.length / BYTES_PER_SECOND).toFixed(1);
+        const durationMs = (pcm.length / BYTES_PER_SECOND) * 1000;
+        const durationSec = (durationMs / 1000).toFixed(1);
+
+        if (durationMs < this.config.vad.minSpeechMs) {
+          this.log.info(JSON.stringify({
+            event: 'UTTERANCE_DROPPED_TOO_SHORT',
+            uttId,
+            durationMs: Math.round(durationMs),
+            minSpeechMs: this.config.vad.minSpeechMs,
+            instanceId: this.instanceId,
+          }));
+          return;
+        }
+
         this.log.debug(`[dv:${this.instanceId}] Utterance: ${durationSec}s (${pcm.length} bytes)`);
         this.pipeline.enqueue({ pcm, uttId });
       });
