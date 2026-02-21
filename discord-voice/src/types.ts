@@ -60,11 +60,49 @@ export interface DiscordVoiceConfig {
     /** Maximum single utterance duration in seconds (safety cap) */
     maxUtteranceSec: number;
   };
+
+  resilience?: {
+    maxReconnectAttempts?: number;
+    reconnectBackoffMs?: number;
+    reconnectBackoffMaxMs?: number;
+    idleDisconnectMin?: number;
+    graceAnnounceSec?: number;
+    userLeftGraceSec?: number;
+  };
+
+  heartbeat?: {
+    intervalMs?: number;
+    silencePromptSec?: number;
+    botStallThresholdSec?: number;
+    initiative?: 'passive' | 'normal' | 'active';
+  };
+
+  cache?: {
+    tts?: {
+      enabled?: boolean;
+      maxSizeMb?: number;
+      preWarmOnConnect?: boolean;
+      /** Override the directory where baked OGG phrase files are stored. */
+      bakedPhrasesDir?: string;
+    };
+  };
+
+  observability?: {
+    metricsLogIntervalSec?: number;
+    healthPort?: number;
+  };
 }
 
 // ── Defaults ────────────────────────────────────────────────────────
 
-export const CONFIG_DEFAULTS: Partial<DiscordVoiceConfig> = {
+export const CONFIG_DEFAULTS: Partial<DiscordVoiceConfig> & {
+  resilience: Required<NonNullable<DiscordVoiceConfig['resilience']>>;
+  heartbeat: Required<NonNullable<DiscordVoiceConfig['heartbeat']>>;
+  cache: Required<NonNullable<DiscordVoiceConfig['cache']>> & {
+    tts: Required<Pick<NonNullable<NonNullable<DiscordVoiceConfig['cache']>['tts']>, 'enabled' | 'maxSizeMb' | 'preWarmOnConnect'>>;
+  };
+  observability: Required<Pick<NonNullable<DiscordVoiceConfig['observability']>, 'metricsLogIntervalSec'>>;
+} = {
   autoJoin: true,
   sessionKey: "voice:default",
   agentId: "voice",
@@ -82,6 +120,30 @@ export const CONFIG_DEFAULTS: Partial<DiscordVoiceConfig> = {
     silenceThresholdMs: 800,
     minSpeechMs: 200,
     maxUtteranceSec: 120,
+  },
+  resilience: {
+    maxReconnectAttempts: 5,
+    reconnectBackoffMs: 1000,
+    reconnectBackoffMaxMs: 30000,
+    idleDisconnectMin: 10,
+    graceAnnounceSec: 30,
+    userLeftGraceSec: 60,
+  },
+  heartbeat: {
+    intervalMs: 15000,
+    silencePromptSec: 60,
+    botStallThresholdSec: 45,
+    initiative: 'normal',
+  },
+  cache: {
+    tts: {
+      enabled: true,
+      maxSizeMb: 50,
+      preWarmOnConnect: true,
+    },
+  },
+  observability: {
+    metricsLogIntervalSec: 60,
   },
 };
 

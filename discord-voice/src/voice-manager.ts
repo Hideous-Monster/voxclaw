@@ -4,15 +4,12 @@
  * Watches for a target user in a Discord voice channel. When they join,
  * we follow. When they leave, we leave. When they speak, we listen.
  *
- * IMPORTANT: This creates its own Discord.js Client. The stock OpenClaw
- * Discord channel also runs a Client with the same bot token. Discord
- * allows multiple gateway connections per bot (up to the shard limit),
- * so this works — but the voice manager only cares about voice states
- * and doesn't handle text messages (that's OpenClaw's job).
- *
- * If OpenClaw's plugin API ever exposes the existing Discord client,
- * we should switch to that. For now, a second connection is the only
- * way to get voice support without forking core.
+ * Phase 3 additions:
+ *   Commit 3: Auto-reconnect with exponential backoff on disconnect.
+ *   Commit 4: Graceful Opus frame error handling (codec desync).
+ *   Commit 5: Idle timeout with grace period announcement + user-left grace.
+ *   Commit 8: VoiceHeartbeat wired up (idle timer migrated, stall/desync/silence).
+ *   Commit 9: Metrics instrumentation.
  */
 
 import {
@@ -26,16 +23,26 @@ import {
   EndBehaviorType,
   VoiceConnection,
   VoiceConnectionStatus,
+  StreamType,
   entersState,
   getVoiceConnection,
   joinVoiceChannel,
+  createAudioResource,
 } from "@discordjs/voice";
 import { OpusEncoder } from "@discordjs/opus";
-import { DiscordVoiceConfig, Logger } from "./types.js";
+import { Readable } from "stream";
+import { DiscordVoiceConfig, Logger, CONFIG_DEFAULTS } from "./types.js";
 import { AudioPipeline } from "./audio-pipeline.js";
+import { VoiceHeartbeat } from "./heartbeat.js";
+import { ttsCache } from "./tts-cache.js";
+import { metrics } from "./metrics.js";
 
 // Discord voice: 48kHz stereo 16-bit
 const BYTES_PER_SECOND = 48_000 * 2 * 2;
+
+// Maximum consecutive Opus decode failures before warning/reset
+const OPUS_WARN_THRESHOLD = 20;
+const OPUS_RESET_THRESHOLD = 50;
 
 export class VoiceManager {
   private client: Client;
@@ -43,6 +50,29 @@ export class VoiceManager {
   private pipeline: AudioPipeline | null = null;
   private guildId: string | null = null;
   private listening = false;
+
+  // Commit 3: prevent concurrent reconnect loops
+  private reconnecting = false;
+
+  // Commit 5: speech timestamps (also used by heartbeat)
+  private lastUserSpeechAt = 0;
+  private lastBotSpeechAt = 0;
+
+  // Commit 5: user-left grace timer
+  private userLeftTimer: NodeJS.Timeout | null = null;
+
+  // Commit 8: heartbeat
+  private heartbeat: VoiceHeartbeat | null = null;
+  private botStallRetried = false;
+
+  // Commit 9: session start + metrics log timer
+  private sessionStartAt = 0;
+  private metricsLogTimer: NodeJS.Timeout | null = null;
+
+  // Resolved config
+  private get resCfg(): Required<NonNullable<DiscordVoiceConfig["resilience"]>> {
+    return { ...CONFIG_DEFAULTS.resilience, ...this.config.resilience };
+  }
 
   constructor(
     private config: DiscordVoiceConfig,
@@ -71,21 +101,23 @@ export class VoiceManager {
       this.log.error("[discord-voice] Discord client error:", err.message);
     });
 
+    // Commit 9: start health server if configured
+    if (this.config.observability?.healthPort) {
+      metrics.startHealthServer(this.config.observability.healthPort, this.log);
+    }
+
     await this.client.login(this.botToken);
   }
 
   async stop(): Promise<void> {
     this.leaveChannel();
+    metrics.stopHealthServer();
     this.client.destroy();
     this.log.info("[discord-voice] Voice manager stopped");
   }
 
   // ── Voice state tracking ────────────────────────────────────────
 
-  /**
-   * On startup, check if the watched user is already in the voice channel.
-   * Handles the case where the bot restarts while someone is in a call.
-   */
   private async checkIfUserAlreadyInChannel(): Promise<void> {
     if (!this.config.autoJoin) return;
 
@@ -105,7 +137,6 @@ export class VoiceManager {
   }
 
   private onVoiceStateUpdate(oldState: VoiceState, newState: VoiceState): void {
-    // Only care about the watched user
     if ((newState.member?.id ?? oldState.member?.id) !== this.config.watchUserId) return;
     if (!this.config.autoJoin) return;
 
@@ -113,13 +144,25 @@ export class VoiceManager {
     const isInOurChannel = newState.channelId === this.config.voiceChannelId;
 
     if (!wasInOurChannel && isInOurChannel) {
-      // Joined our channel
+      // User rejoined — cancel any user-left grace timer
+      if (this.userLeftTimer) {
+        clearTimeout(this.userLeftTimer);
+        this.userLeftTimer = null;
+        this.log.debug("[discord-voice] User rejoined — cancelled user-left timer");
+      }
       this.log.info(`[discord-voice] ${newState.member?.displayName ?? "User"} joined — following`);
       this.joinChannel(newState.channel as VoiceChannel);
     } else if (wasInOurChannel && !isInOurChannel) {
-      // Left our channel (or moved to a different one)
-      this.log.info(`[discord-voice] ${oldState.member?.displayName ?? "User"} left — leaving`);
-      this.leaveChannel();
+      // User left — start grace timer (Commit 5)
+      this.log.info(
+        `[discord-voice] ${oldState.member?.displayName ?? "User"} left — starting ${this.resCfg.userLeftGraceSec}s grace timer`
+      );
+      if (this.userLeftTimer) clearTimeout(this.userLeftTimer);
+      this.userLeftTimer = setTimeout(() => {
+        this.userLeftTimer = null;
+        this.log.info("[discord-voice] User-left grace expired — leaving channel");
+        this.leaveChannel();
+      }, this.resCfg.userLeftGraceSec * 1000);
     }
   }
 
@@ -128,14 +171,20 @@ export class VoiceManager {
   private async joinChannel(channel: VoiceChannel): Promise<void> {
     if (!channel.guild) return;
 
-    // Already connected?
     if (getVoiceConnection(channel.guild.id)) {
       this.log.debug("[discord-voice] Already in voice channel");
       return;
     }
 
     this.guildId = channel.guild.id;
-    this.pipeline = new AudioPipeline(this.config, this.log);
+
+    // Commit 5/8: bot speech callback → update timestamp + heartbeat
+    this.pipeline = new AudioPipeline(this.config, this.log, {
+      onBotSpeech: () => {
+        this.lastBotSpeechAt = Date.now();
+        this.heartbeat?.reportBotSpeech();
+      },
+    });
 
     this.log.info(`[discord-voice] Joining channel ${channel.id} in guild ${channel.guild.id}`);
 
@@ -149,17 +198,50 @@ export class VoiceManager {
       });
 
       this.connection.on("stateChange", (oldState, newState) => {
-        this.log.debug(`[discord-voice] Connection state: ${oldState.status} → ${newState.status}`);
+        this.log.debug(
+          `[discord-voice] Connection state: ${oldState.status} → ${newState.status}`
+        );
       });
 
       this.connection.on("error", (err) => {
         this.log.error(`[discord-voice] Connection error: ${err?.message ?? err}`);
       });
 
+      // Commit 3: reconnect on disconnect
+      this.connection.on("stateChange", (_old, newState) => {
+        if (newState.status === VoiceConnectionStatus.Disconnected) {
+          this.handleDisconnect();
+        }
+      });
+
       this.connection.subscribe(this.pipeline.getPlayer());
 
       await entersState(this.connection, VoiceConnectionStatus.Ready, 15_000);
       this.log.info("[discord-voice] Voice connection ready");
+
+      // Commit 8: start heartbeat
+      this.heartbeat = new VoiceHeartbeat(this.config, this.log, {
+        onSilencePrompt: () => this.handleSilencePrompt(),
+        onGraceAnnounce: () => this.handleGraceAnnounce(),
+        onBotStall: () => this.handleBotStall(),
+        onDesync: () => this.handleAudioDesync(),
+        onIdleTimeout: () => this.leaveChannel(),
+      });
+      this.heartbeat.start();
+
+      // Commit 9: session metrics + log timer
+      this.sessionStartAt = Date.now();
+      metrics.increment("voice.session.count");
+
+      const metricsIntervalMs =
+        (this.config.observability?.metricsLogIntervalSec ??
+          CONFIG_DEFAULTS.observability.metricsLogIntervalSec) * 1000;
+      this.metricsLogTimer = setInterval(() => {
+        this.log.info(
+          `[discord-voice] 📊 metrics: ${JSON.stringify(metrics.snapshot())}`
+        );
+      }, metricsIntervalMs);
+
       this.startListening();
     } catch (err: any) {
       this.log.error(`[discord-voice] Failed to join: ${err?.message ?? err} (${typeof err})`);
@@ -173,12 +255,91 @@ export class VoiceManager {
     this.pipeline?.stop();
     this.pipeline = null;
 
+    // Commit 5: clear user-left timer
+    if (this.userLeftTimer) {
+      clearTimeout(this.userLeftTimer);
+      this.userLeftTimer = null;
+    }
+
+    // Commit 8: stop heartbeat
+    this.heartbeat?.stop();
+    this.heartbeat = null;
+
+    // Commit 9: stop metrics log timer
+    if (this.metricsLogTimer) {
+      clearInterval(this.metricsLogTimer);
+      this.metricsLogTimer = null;
+    }
+
     if (this.guildId) {
       getVoiceConnection(this.guildId)?.destroy();
     }
 
     this.connection = null;
     this.guildId = null;
+    this.reconnecting = false;
+  }
+
+  // ── Commit 3: auto-reconnect with exponential backoff ──────────
+
+  private handleDisconnect(): void {
+    if (this.reconnecting) return;
+    this.reconnecting = true;
+
+    this.doReconnect().catch((err) => {
+      this.log.error("[discord-voice] Reconnect loop error:", err?.message);
+      this.leaveChannel();
+    });
+  }
+
+  private async doReconnect(): Promise<void> {
+    const { maxReconnectAttempts, reconnectBackoffMs, reconnectBackoffMaxMs } = this.resCfg;
+
+    metrics.increment("voice.reconnect.count");
+
+    for (let attempt = 1; attempt <= maxReconnectAttempts; attempt++) {
+      const delay = Math.min(
+        reconnectBackoffMs * Math.pow(2, attempt - 1),
+        reconnectBackoffMaxMs
+      );
+
+      this.log.info(
+        `[discord-voice] Reconnecting (attempt ${attempt}/${maxReconnectAttempts})...`
+      );
+
+      await sleep(delay);
+
+      if (!this.connection) {
+        this.reconnecting = false;
+        return; // leaveChannel was called during the delay
+      }
+
+      try {
+        await entersState(this.connection, VoiceConnectionStatus.Signalling, 15_000);
+        await entersState(this.connection, VoiceConnectionStatus.Ready, 15_000);
+
+        // Success — re-subscribe player and restart listening
+        if (this.pipeline) {
+          this.connection.subscribe(this.pipeline.getPlayer());
+        }
+        this.listening = false;
+        this.startListening();
+        this.reconnecting = false;
+
+        metrics.increment("voice.reconnect.success");
+        this.log.info("[discord-voice] Reconnected successfully");
+        return;
+      } catch {
+        // This attempt failed — try again
+      }
+    }
+
+    // Exhausted all attempts
+    this.log.error(
+      `[discord-voice] Reconnect failed after ${maxReconnectAttempts} attempts — leaving channel`
+    );
+    this.reconnecting = false;
+    this.leaveChannel();
   }
 
   // ── Audio capture ───────────────────────────────────────────────
@@ -191,18 +352,20 @@ export class VoiceManager {
     const decoder = new OpusEncoder(48_000, 2);
     const maxBytes = this.config.vad.maxUtteranceSec * BYTES_PER_SECOND;
 
-    // Track whether we're currently capturing to prevent overlapping subscriptions.
-    // Discord fires "start" multiple times per utterance (e.g. brief pauses between
-    // words). We only create one subscription per continuous speech block.
     let capturing = false;
 
     receiver.speaking.on("start", (userId) => {
       if (userId !== this.config.watchUserId) return;
-      if (capturing) return; // Already listening, ignore re-fires
+      if (capturing) return;
 
       capturing = true;
 
-      // Interrupt: if Carla is currently speaking, shut up immediately
+      // Commit 5: update speech timestamp + heartbeat
+      this.lastUserSpeechAt = Date.now();
+      this.heartbeat?.reportUserSpeech();
+      this.heartbeat?.setUserSpeaking(true);
+
+      // Interrupt Carla if speaking
       if (this.pipeline) {
         this.pipeline.interrupt();
       }
@@ -218,21 +381,45 @@ export class VoiceManager {
 
       const chunks: Buffer[] = [];
       let totalBytes = 0;
+      // Commit 4: per-stream consecutive Opus decode failure counter
+      let consecutiveDecodeFailures = 0;
 
       stream.on("data", (packet: Buffer) => {
         if (totalBytes >= maxBytes) return;
+
+        // Commit 8: report audio frame received
+        this.heartbeat?.reportAudioFrameReceived();
 
         try {
           const pcm = decoder.decode(packet);
           chunks.push(pcm);
           totalBytes += pcm.length;
+          // Commit 4: reset counter on success
+          consecutiveDecodeFailures = 0;
         } catch {
-          // Opus decode can fail on silence/comfort-noise packets — ignore
+          // Commit 4: track consecutive failures
+          consecutiveDecodeFailures++;
+          metrics.increment("voice.opus.decode_errors");
+
+          if (consecutiveDecodeFailures === OPUS_WARN_THRESHOLD + 1) {
+            this.log.warn(
+              `[discord-voice] Possible codec desync — ${consecutiveDecodeFailures} consecutive Opus decode failures`
+            );
+          }
+
+          if (consecutiveDecodeFailures > OPUS_RESET_THRESHOLD) {
+            this.log.warn(
+              "[discord-voice] Receive stream reset due to codec desync"
+            );
+            stream.destroy();
+            // Re-subscribe will happen on the next "start" event
+          }
         }
       });
 
       stream.once("end", () => {
-        capturing = false; // Ready for next utterance
+        capturing = false;
+        this.heartbeat?.setUserSpeaking(false);
 
         if (chunks.length === 0 || !this.pipeline) return;
 
@@ -244,8 +431,106 @@ export class VoiceManager {
 
       stream.once("error", (err) => {
         capturing = false;
+        this.heartbeat?.setUserSpeaking(false);
         this.log.error("[discord-voice] Audio stream error:", err.message);
       });
     });
   }
+
+  // ── Commit 8: heartbeat callback handlers ──────────────────────
+
+  private handleSilencePrompt(): void {
+    if (!this.pipeline) return;
+
+    const cached = ttsCache.getRandomGreeting("check-ins");
+    if (cached) {
+      // Play the cached buffer directly through the player.
+      // isOggOpus=true for baked disk phrases; false for in-memory MP3.
+      this.playBuffer(
+        cached.buffer,
+        cached.isOggOpus ? StreamType.OggOpus : StreamType.Arbitrary
+      );
+    } else {
+      // Cache miss — synthesise fallback
+      this.pipeline.synthesiseAsync("Still there?").catch((err) => {
+        this.log.warn("[discord-voice] Silence prompt TTS error:", err?.message);
+      });
+    }
+  }
+
+  private handleGraceAnnounce(): void {
+    if (!this.pipeline) return;
+    this.pipeline
+      .synthesiseAsync("Hey, I'm gonna head out if nobody says anything.")
+      .catch((err) => {
+        this.log.warn("[discord-voice] Grace announce TTS error:", err?.message);
+      });
+  }
+
+  private handleBotStall(): void {
+    if (!this.pipeline) return;
+
+    const lastTranscript = this.pipeline.lastTranscript;
+    this.log.warn(
+      `[discord-voice] Bot stall detected — last transcript: "${lastTranscript?.slice(0, 80) ?? "(none)"}"`
+    );
+
+    if (!lastTranscript) return;
+
+    if (!this.botStallRetried) {
+      // First stall — interrupt and play recovery, then try reconnect
+      this.botStallRetried = true;
+      this.log.info("[discord-voice] Retrying after stall — interrupting and reconnecting");
+      this.pipeline.interrupt();
+      this.pipeline
+        .synthesiseAsync("Having some trouble, one sec.")
+        .catch((err: any) => {
+          this.log.warn("[discord-voice] Stall recovery TTS error:", err?.message);
+        });
+      if (this.connection) {
+        this.handleDisconnect();
+      }
+    } else {
+      // Subsequent stall — just play recovery message, reset flag
+      this.botStallRetried = false;
+      this.pipeline
+        .synthesiseAsync("Having some trouble, one sec.")
+        .catch((err: any) => {
+          this.log.warn("[discord-voice] Stall recovery TTS error:", err?.message);
+        });
+    }
+  }
+
+  private handleAudioDesync(): void {
+    if (!this.connection) return;
+    this.log.warn("[discord-voice] Audio desync detected — resetting receiver subscription");
+
+    // Destroy and re-subscribe by restarting the listener
+    this.listening = false;
+    this.startListening();
+  }
+
+  /**
+   * Play a raw audio buffer directly through the audio player.
+   * Used for cached check-in phrases (we have the buffer but not the text).
+   * streamType defaults to Arbitrary (MP3); pass OggOpus for baked disk phrases.
+   */
+  private playBuffer(buffer: Buffer, streamType: StreamType = StreamType.Arbitrary): void {
+    if (!this.pipeline) return;
+
+    try {
+      const resource = createAudioResource(Readable.from(buffer), {
+        inputType: streamType,
+      });
+      this.pipeline.getPlayer().play(resource);
+    } catch (err: any) {
+      this.log.error("[discord-voice] playBuffer error:", err?.message);
+    }
+  }
+}
+
+// ── Utilities ───────────────────────────────────────────────────────
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
