@@ -4,7 +4,8 @@
   "description": "Discord voice channel plugin for OpenClaw",
   "main": "index.ts",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "bake-phrases": "npx ts-node scripts/bake-phrases.ts"
   },
   "dependencies": {
     "@discordjs/opus": "^0.9.0",
