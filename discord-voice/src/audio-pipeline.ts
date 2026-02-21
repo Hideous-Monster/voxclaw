@@ -80,12 +80,8 @@ export class AudioPipeline {
       this.playNextAudioChunk();
     });
 
-    // Commit 7: pre-warm TTS cache from phrase files (fire and forget)
-    if (config.cache?.tts?.preWarmOnConnect !== false) {
-      this.startPreWarm().catch((err) => {
-        this.log.warn("[discord-voice] Pre-warm error:", err?.message);
-      });
-    }
+    // Load baked phrase OGG files from disk (no TTS calls — run bake-phrases first)
+    this.loadBakedPhrases();
   }
 
   getPlayer(): AudioPlayer {
@@ -168,21 +164,6 @@ export class AudioPipeline {
         this.log.debug(`[discord-voice] Filtered noise: "${transcript}"`);
         this.processing = false;
         this.processNextUtterance();
-        return;
-      }
-
-      // Filter out noise: single words, very short utterances, common
-      // Whisper hallucinations on silence/noise
-      const NOISE_PATTERNS = [
-        /^(you|the|a|um|uh|hmm|oh|ah|bye|thank you|thanks)\.?$/i,
-        /^\W+$/, // just punctuation
-      ];
-      const wordCount = transcript.split(/\s+/).length;
-      const isNoise = wordCount <= 2 && NOISE_PATTERNS.some(p => p.test(transcript));
-      if (isNoise) {
-        this.log.debug(`[discord-voice] Filtered noise: "${transcript}"`);
-        this.processing = false;
-        this.processNext();
         return;
       }
 
@@ -319,39 +300,11 @@ export class AudioPipeline {
     });
   }
 
-  // ── Commit 7: pre-warm phrase files ─────────────────────────────
+  // ── Load baked phrases from disk (no TTS calls) ──────────────────
 
-  private async startPreWarm(): Promise<void> {
-    const phrasesDir = path.resolve(__dirname, "../phrases");
-
-    const load = (filename: string): string[] => {
-      try {
-        const raw = fs.readFileSync(path.join(phrasesDir, filename), "utf8");
-        return raw
-          .split("\n")
-          .map((l) => l.trim())
-          .filter((l) => l.length > 0);
-      } catch (err: any) {
-        this.log.warn(`[discord-voice] Could not read ${filename}: ${err?.message}`);
-        return [];
-      }
-    };
-
-    const greetings = load("greetings.txt");
-    const checkIns = load("check-ins.txt");
-
-    if (greetings.length > 0) {
-      this.log.info(`[discord-voice] Pre-warming ${greetings.length} phrases (greetings)...`);
-      ttsCache
-        .preWarm(greetings, "greetings", this.config, this.openai, this.log)
-        .catch((err) => this.log.warn("[discord-voice] greetings preWarm error:", err?.message));
-    }
-
-    if (checkIns.length > 0) {
-      this.log.info(`[discord-voice] Pre-warming ${checkIns.length} phrases (check-ins)...`);
-      ttsCache
-        .preWarm(checkIns, "check-ins", this.config, this.openai, this.log)
-        .catch((err) => this.log.warn("[discord-voice] check-ins preWarm error:", err?.message));
-    }
+  private loadBakedPhrases(): void {
+    const bakedDir = path.resolve(__dirname, "../phrases/baked");
+    ttsCache.loadBakedOnly(bakedDir, "greetings", this.log);
+    ttsCache.loadBakedOnly(bakedDir, "check-ins", this.log);
   }
 }
