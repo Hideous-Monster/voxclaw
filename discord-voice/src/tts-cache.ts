@@ -421,5 +421,47 @@ export class TtsCache {
     );
   }
 
+  /**
+   * Load baked OGG files from disk into cache — no TTS calls ever.
+   * Returns the number of phrases loaded. Logs a warning if no baked
+   * files are found and directs the user to run bake-phrases.
+   */
+  loadBakedOnly(bakedDir: string, label: PhraseLabel, log: Logger): number {
+    const manifestPath = path.join(bakedDir, "manifest.json");
+    let manifest: BakedManifest;
+    try {
+      manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as BakedManifest;
+    } catch {
+      log.warn(
+        `[discord-voice] No baked phrases found for "${label}" — run \`npm run bake-phrases\` first.`
+      );
+      return 0;
+    }
+
+    let loaded = 0;
+    for (const [filename, phrase] of Object.entries(manifest.entries)) {
+      const label_ = filename.split("-")[0] as PhraseLabel;
+      if (label_ !== label) continue;
+      const filepath = path.join(bakedDir, filename);
+      try {
+        const buffer = fs.readFileSync(filepath);
+        const key = filename.replace(/\.ogg$/, "").split("-").slice(1).join("-");
+        this.cache.set(key, { buffer, lastUsed: Date.now(), size: buffer.length });
+        this.totalSize += buffer.length;
+        this.registerPhraseKey(key, label);
+        this.bakedOggKeys.add(key);
+        loaded++;
+      } catch (err: any) {
+        log.warn(`[discord-voice] Failed to load baked file ${filename}: ${err?.message}`);
+      }
+    }
+
+    if (loaded > 0) {
+      log.info(`[discord-voice] Loaded ${loaded} baked ${label} phrases from disk.`);
+    }
+    return loaded;
+  }
+}
+
 /** Global singleton. */
 export const ttsCache = new TtsCache();

@@ -63,11 +63,8 @@ export class AudioPipeline {
       }
     });
 
-    if (config.cache?.tts?.preWarmOnConnect !== false) {
-      this.startPreWarm().catch((err) => {
-        this.log.warn(`[dv:${this.instanceId}] Pre-warm error:`, err?.message);
-      });
-    }
+    // Load baked phrase OGG files from disk (no TTS calls — run bake-phrases first)
+    this.loadBakedPhrases();
   }
 
   private instanceId: string;
@@ -322,37 +319,11 @@ export class AudioPipeline {
     });
   }
 
-  private async startPreWarm(): Promise<void> {
-    const phrasesDir = path.resolve(__dirname, "../phrases");
+  // ── Load baked phrases from disk (no TTS calls) ──────────────────
 
-    const load = (filename: string): string[] => {
-      try {
-        const raw = fs.readFileSync(path.join(phrasesDir, filename), "utf8");
-        return raw
-          .split("\n")
-          .map((l) => l.trim())
-          .filter((l) => l.length > 0);
-      } catch (err: any) {
-        this.log.warn(`[dv:${this.instanceId}] Could not read ${filename}: ${err?.message}`);
-        return [];
-      }
-    };
-
-    const greetings = load("greetings.txt");
-    const checkIns = load("check-ins.txt");
-
-    if (greetings.length > 0) {
-      this.log.info(`[dv:${this.instanceId}] Pre-warming ${greetings.length} phrases (greetings)...`);
-      ttsCache
-        .preWarm(greetings, "greetings", this.config, this.openai, this.log)
-        .catch((err) => this.log.warn(`[dv:${this.instanceId}] greetings preWarm error:`, err?.message));
-    }
-
-    if (checkIns.length > 0) {
-      this.log.info(`[dv:${this.instanceId}] Pre-warming ${checkIns.length} phrases (check-ins)...`);
-      ttsCache
-        .preWarm(checkIns, "check-ins", this.config, this.openai, this.log)
-        .catch((err) => this.log.warn(`[dv:${this.instanceId}] check-ins preWarm error:`, err?.message));
-    }
+  private loadBakedPhrases(): void {
+    const bakedDir = path.resolve(__dirname, "../phrases/baked");
+    ttsCache.loadBakedOnly(bakedDir, "greetings", this.log);
+    ttsCache.loadBakedOnly(bakedDir, "check-ins", this.log);
   }
 }

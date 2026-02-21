@@ -24,22 +24,33 @@ const REPO_ROOT = path.dirname(path.dirname(__filename));
 const BAKED_DIR = path.join(REPO_ROOT, 'phrases', 'baked');
 const MANIFEST_PATH = path.join(BAKED_DIR, 'manifest.json');
 
-// Load config from openclaw.plugin.json
+// Load config — actual plugin config from ~/.openclaw/openclaw.json,
+// falling back to schema defaults in openclaw.plugin.json
 function loadConfig(): BakeConfig {
+  // Try actual runtime config first
+  const runtimeConfigPath = path.join(process.env.HOME || '~', '.openclaw', 'openclaw.json');
+  try {
+    const runtime = JSON.parse(fs.readFileSync(runtimeConfigPath, 'utf-8'));
+    const tts = runtime?.plugins?.entries?.['openclaw-discord-voice']?.config?.tts;
+    if (tts?.model && tts?.voice) {
+      return {
+        provider: tts.provider || 'openai',
+        model: tts.model,
+        voice: tts.voice,
+        instructions: tts.instructions || '',
+      };
+    }
+  } catch { /* fall through to schema defaults */ }
+
+  // Fall back to schema defaults
   const pluginConfigPath = path.join(REPO_ROOT, 'openclaw.plugin.json');
   const pluginConfig = JSON.parse(fs.readFileSync(pluginConfigPath, 'utf-8'));
-
-  if (!pluginConfig.configSchema?.properties?.tts) {
-    throw new Error('No TTS config found in openclaw.plugin.json');
-  }
-
-  // Get TTS config - defaults from schema if not in actual config
-  const ttsConfig = pluginConfig.configSchema.properties.tts.properties;
+  const ttsConfig = pluginConfig.configSchema?.properties?.tts?.properties ?? {};
   return {
     provider: ttsConfig.provider?.default || 'openai',
     model: ttsConfig.model?.default || 'gpt-4o-mini-tts',
     voice: ttsConfig.voice?.default || 'nova',
-    instructions: ttsConfig.instructions?.description || '',
+    instructions: '',
   };
 }
 
