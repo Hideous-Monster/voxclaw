@@ -1,19 +1,5 @@
 /**
  * Audio Pipeline — The Conductor (Phase 2: Streaming + Phase 3: Cache + Observability)
- *
- * The pipeline is sentence-level rather than utterance-level:
- *
- *   1. User speaks → PCM buffer collected
- *   2. Whisper transcribes the utterance
- *   3. Completions streams back sentence-by-sentence (SSE)
- *   4. Each sentence is synthesised to audio immediately
- *   5. Audio chunks are queued for sequential playback
- *
- * Phase 3 additions:
- *   - Commit 5: onBotSpeech callback fired when audio playback starts
- *   - Commit 6: TTS LRU cache — check before calling TTS API
- *   - Commit 7: Pre-warm phrase files on connect
- *   - Commit 9: Metrics instrumentation (STT, TTS, LLM, e2e latency)
  */
 
 import {
@@ -38,33 +24,27 @@ export class AudioPipeline {
   private player: AudioPlayer;
   private openai: OpenAI;
   private processing = false;
-  private utteranceQueue: Buffer[] = [];
+  private utteranceQueue: Array<{ pcm: Buffer; uttId: string }> = [];
 
-  // Audio chunks ready for playback (from TTS). Played sequentially.
-  // Each entry carries a StreamType so OGG Opus baked buffers are decoded
-  // correctly (StreamType.OggOpus) vs on-the-fly MP3 (StreamType.Arbitrary).
   private audioQueue: Array<{ buffer: Buffer; streamType: StreamType }> = [];
   private playingAudio = false;
 
-  // Abort controller for the current streaming completion
   private currentAbort: AbortController | null = null;
-
-  // Commit 5: callback fired when the first audio chunk of a response starts playing
   private onBotSpeech?: () => void;
 
-  // Commit 9: e2e latency tracking — timestamp when user utterance was dequeued
   private utteranceStartAt = 0;
   private e2eRecorded = false;
+  private currentUttId: string | null = null;
 
-  // Commit 8: last transcript for retry on bot stall
   lastTranscript: string | null = null;
 
   constructor(
     private config: DiscordVoiceConfig,
     private log: Logger,
-    options?: { onBotSpeech?: () => void }
+    options?: { onBotSpeech?: () => void; instanceId?: string }
   ) {
     this.onBotSpeech = options?.onBotSpeech;
+    this.instanceId = options?.instanceId ?? "unknown";
 
     this.openai = new OpenAI({
       apiKey: config.stt.apiKey ?? config.tts.apiKey ?? process.env.OPENAI_API_KEY,
@@ -73,39 +53,46 @@ export class AudioPipeline {
     this.player = createAudioPlayer();
 
     this.player.on("error", (err) => {
-      this.log.error("[discord-voice] Audio player error:", err.message);
+      this.log.error(`[dv:${this.instanceId}] Audio player error:`, err.message);
     });
 
     this.player.on(AudioPlayerStatus.Idle, () => {
       this.playNextAudioChunk();
+      if (!this.playingAudio && this.audioQueue.length === 0 && this.currentUttId) {
+        this.log.info(JSON.stringify({ event: "PLAYBACK_DONE", uttId: this.currentUttId }));
+      }
     });
 
-    // Commit 7: pre-warm TTS cache from phrase files (fire and forget)
     if (config.cache?.tts?.preWarmOnConnect !== false) {
       this.startPreWarm().catch((err) => {
-        this.log.warn("[discord-voice] Pre-warm error:", err?.message);
+        this.log.warn(`[dv:${this.instanceId}] Pre-warm error:`, err?.message);
       });
     }
   }
+
+  private instanceId: string;
 
   getPlayer(): AudioPlayer {
     return this.player;
   }
 
-  /**
-   * Queue a PCM buffer (one complete utterance) for processing.
-   */
-  enqueue(pcmBuffer: Buffer): void {
-    this.utteranceQueue.push(pcmBuffer);
+  enqueue(item: { pcm: Buffer; uttId: string }): void {
+    this.utteranceQueue.push(item);
+    this.log.info(
+      JSON.stringify({
+        event: "UTTERANCE_RECEIVED",
+        uttId: item.uttId,
+        queueDepth: this.utteranceQueue.length,
+      })
+    );
     if (!this.processing) {
       this.processNextUtterance();
     }
   }
 
-  /**
-   * Interrupt: user started speaking. Kill everything in progress.
-   */
   interrupt(): void {
+    this.log.info(JSON.stringify({ event: "INTERRUPT", uttId: this.currentUttId }));
+
     if (this.currentAbort) {
       this.currentAbort.abort();
       this.currentAbort = null;
@@ -117,47 +104,55 @@ export class AudioPipeline {
     this.e2eRecorded = false;
 
     if (this.player.state.status !== AudioPlayerStatus.Idle) {
-      this.log.debug("[discord-voice] Interrupted — killing playback + stream");
+      this.log.debug(`[dv:${this.instanceId}] Interrupted — killing playback + stream`);
       this.player.stop(true);
     }
 
     this.processing = false;
   }
 
-  /** Hard stop */
   stop(): void {
     this.interrupt();
   }
 
-  // ── Utterance processing ────────────────────────────────────────
-
   private async processNextUtterance(): Promise<void> {
-    const pcmBuffer = this.utteranceQueue.shift();
-    if (!pcmBuffer) {
+    const item = this.utteranceQueue.shift();
+    if (!item) {
       this.processing = false;
+      this.currentUttId = null;
       return;
     }
+
+    const { pcm: pcmBuffer, uttId } = item;
+    this.currentUttId = uttId;
 
     this.processing = true;
     this.utteranceStartAt = Date.now();
     this.e2eRecorded = false;
 
     try {
-      // ── STT ───────────────────────────────────────────────────
-      this.log.debug("[discord-voice] Transcribing...");
+      this.log.info(JSON.stringify({ event: "STT_START", uttId }));
       const sttStart = Date.now();
       metrics.increment("voice.stt.requests");
       const transcript = await transcribe(pcmBuffer, this.config, this.openai, this.log);
-      metrics.timing("voice.stt.latency_ms", Date.now() - sttStart);
+      const sttDurationMs = Date.now() - sttStart;
+      metrics.timing("voice.stt.latency_ms", sttDurationMs);
+      this.log.info(
+        JSON.stringify({
+          event: "STT_DONE",
+          uttId,
+          transcript: transcript ?? "",
+          durationMs: sttDurationMs,
+        })
+      );
 
       if (!transcript) {
-        this.log.debug("[discord-voice] Empty transcript, skipping");
+        this.log.info(JSON.stringify({ event: "UTTERANCE_FILTERED", uttId, reason: "empty" }));
         this.processing = false;
         this.processNextUtterance();
         return;
       }
 
-      // Noise filter
       const NOISE_PATTERNS = [
         /^(you|the|a|um|uh|hmm|oh|ah|bye|thank you|thanks)\.?$/i,
         /^\W+$/,
@@ -165,38 +160,32 @@ export class AudioPipeline {
       const wordCount = transcript.split(/\s+/).length;
       const isNoise = wordCount <= 2 && NOISE_PATTERNS.some((p) => p.test(transcript));
       if (isNoise) {
-        this.log.debug(`[discord-voice] Filtered noise: "${transcript}"`);
+        this.log.info(
+          JSON.stringify({
+            event: "UTTERANCE_FILTERED",
+            uttId,
+            reason: "noise",
+            transcript,
+          })
+        );
         this.processing = false;
         this.processNextUtterance();
         return;
       }
 
-      // Filter out noise: single words, very short utterances, common
-      // Whisper hallucinations on silence/noise
-      const NOISE_PATTERNS = [
-        /^(you|the|a|um|uh|hmm|oh|ah|bye|thank you|thanks)\.?$/i,
-        /^\W+$/, // just punctuation
-      ];
-      const wordCount = transcript.split(/\s+/).length;
-      const isNoise = wordCount <= 2 && NOISE_PATTERNS.some(p => p.test(transcript));
-      if (isNoise) {
-        this.log.debug(`[discord-voice] Filtered noise: "${transcript}"`);
-        this.processing = false;
-        this.processNext();
-        return;
-      }
-
-      this.log.info(`[discord-voice] 🎤 "${transcript}"`);
+      this.log.info(`[dv:${this.instanceId}] 🎤 "${transcript}"`);
       this.lastTranscript = transcript;
 
-      // ── Streaming completions + chunked TTS ───────────────────
       this.currentAbort = new AbortController();
 
       const llmStart = Date.now();
+      this.log.info(JSON.stringify({ event: "LLM_START", uttId }));
       try {
         const fullText = await streamFromAgent(
           transcript,
           this.config,
+          uttId,
+          this.instanceId,
           this.log,
           (sentence) => {
             this.synthesiseAndQueue(sentence);
@@ -204,13 +193,22 @@ export class AudioPipeline {
           this.currentAbort.signal
         );
 
-        metrics.timing("voice.llm.latency_ms", Date.now() - llmStart);
+        const llmDurationMs = Date.now() - llmStart;
+        metrics.timing("voice.llm.latency_ms", llmDurationMs);
+        this.log.info(
+          JSON.stringify({
+            event: "LLM_DONE",
+            uttId,
+            durationMs: llmDurationMs,
+            charCount: fullText.length,
+          })
+        );
 
         const preview = fullText.length > 120 ? fullText.slice(0, 120) + "…" : fullText;
-        this.log.info(`[discord-voice] 🗣️ "${preview}"`);
+        this.log.info(`[dv:${this.instanceId}] 🗣️ "${preview}"`);
       } catch (err: any) {
         if (err?.name === "AbortError") {
-          this.log.debug("[discord-voice] Completion stream aborted (interrupted)");
+          this.log.debug(`[dv:${this.instanceId}] Completion stream aborted (interrupted)`);
         } else {
           metrics.increment("voice.llm.errors");
           throw err;
@@ -220,43 +218,42 @@ export class AudioPipeline {
       this.currentAbort = null;
 
       await this.waitForPlaybackComplete();
+      this.log.info(
+        JSON.stringify({ event: "UTTERANCE_COMPLETE", uttId, e2eMs: Date.now() - this.utteranceStartAt })
+      );
 
       this.processing = false;
       this.processNextUtterance();
     } catch (err: any) {
-      this.log.error("[discord-voice] Pipeline error:", err?.message ?? err);
+      this.log.error(`[dv:${this.instanceId}] Pipeline error:`, err?.message ?? err);
       this.processing = false;
       this.currentAbort = null;
       setTimeout(() => this.processNextUtterance(), 1000);
     }
   }
 
-  // ── TTS + audio queue ───────────────────────────────────────────
-
-  /**
-   * Synthesise a sentence to audio and add it to the playback queue.
-   * Checks TTS cache first; falls back to TTS API on miss.
-   */
   private synthesiseAndQueue(sentence: string): void {
     this.synthesiseAsync(sentence).catch((err) => {
-      this.log.error(
-        `[discord-voice] TTS error for "${sentence.slice(0, 50)}": ${err?.message}`
-      );
+      this.log.error(`[dv:${this.instanceId}] TTS error for "${sentence.slice(0, 50)}": ${err?.message}`);
     });
   }
 
   async synthesiseAsync(sentence: string): Promise<Buffer> {
-    this.log.debug(`[discord-voice] TTS: "${sentence.slice(0, 60)}..."`);
-
     const key = ttsCache.buildKey(this.config, sentence);
     const cached = ttsCache.get(key);
+    const sentencePreview = sentence.slice(0, 60);
+    const uttId = this.currentUttId;
 
+    this.log.info(
+      JSON.stringify({ event: "TTS_START", uttId, sentence: sentencePreview, cached: Boolean(cached) })
+    );
+
+    const ttsStart = Date.now();
     let mp3Buffer: Buffer;
 
     if (cached) {
       mp3Buffer = cached;
     } else {
-      const ttsStart = Date.now();
       metrics.increment("voice.tts.requests");
       mp3Buffer = await synthesise(sentence, this.config, this.openai, this.log);
       metrics.timing("voice.tts.latency_ms", Date.now() - ttsStart);
@@ -266,6 +263,15 @@ export class AudioPipeline {
         ttsCache.set(key, mp3Buffer, maxSizeMb);
       }
     }
+
+    this.log.info(
+      JSON.stringify({
+        event: "TTS_DONE",
+        uttId,
+        durationMs: Date.now() - ttsStart,
+        cached: Boolean(cached),
+      })
+    );
 
     this.audioQueue.push({ buffer: mp3Buffer, streamType: StreamType.Arbitrary });
 
@@ -284,28 +290,23 @@ export class AudioPipeline {
     }
 
     this.playingAudio = true;
+    if (this.currentUttId) {
+      this.log.info(JSON.stringify({ event: "PLAYBACK_START", uttId: this.currentUttId }));
+    }
 
-    // Commit 5: notify VoiceManager that bot is speaking
     this.onBotSpeech?.();
 
-    // Commit 9: record e2e latency on first chunk of each utterance
     if (!this.e2eRecorded && this.utteranceStartAt > 0) {
       metrics.timing("voice.pipeline.e2e_latency_ms", Date.now() - this.utteranceStartAt);
       this.e2eRecorded = true;
     }
 
-    // Baked OGG Opus buffers must use StreamType.OggOpus so @discordjs/voice
-    // does not try to re-decode them as raw PCM/Arbitrary.
     const resource = createAudioResource(Readable.from(entry.buffer), {
       inputType: entry.streamType,
     });
     this.player.play(resource);
   }
 
-  /**
-   * Wait for all queued audio to finish playing.
-   * Resolves immediately if nothing is playing/queued.
-   */
   private waitForPlaybackComplete(): Promise<void> {
     return new Promise((resolve) => {
       const check = () => {
@@ -319,8 +320,6 @@ export class AudioPipeline {
     });
   }
 
-  // ── Commit 7: pre-warm phrase files ─────────────────────────────
-
   private async startPreWarm(): Promise<void> {
     const phrasesDir = path.resolve(__dirname, "../phrases");
 
@@ -332,7 +331,7 @@ export class AudioPipeline {
           .map((l) => l.trim())
           .filter((l) => l.length > 0);
       } catch (err: any) {
-        this.log.warn(`[discord-voice] Could not read ${filename}: ${err?.message}`);
+        this.log.warn(`[dv:${this.instanceId}] Could not read ${filename}: ${err?.message}`);
         return [];
       }
     };
@@ -341,17 +340,17 @@ export class AudioPipeline {
     const checkIns = load("check-ins.txt");
 
     if (greetings.length > 0) {
-      this.log.info(`[discord-voice] Pre-warming ${greetings.length} phrases (greetings)...`);
+      this.log.info(`[dv:${this.instanceId}] Pre-warming ${greetings.length} phrases (greetings)...`);
       ttsCache
         .preWarm(greetings, "greetings", this.config, this.openai, this.log)
-        .catch((err) => this.log.warn("[discord-voice] greetings preWarm error:", err?.message));
+        .catch((err) => this.log.warn(`[dv:${this.instanceId}] greetings preWarm error:`, err?.message));
     }
 
     if (checkIns.length > 0) {
-      this.log.info(`[discord-voice] Pre-warming ${checkIns.length} phrases (check-ins)...`);
+      this.log.info(`[dv:${this.instanceId}] Pre-warming ${checkIns.length} phrases (check-ins)...`);
       ttsCache
         .preWarm(checkIns, "check-ins", this.config, this.openai, this.log)
-        .catch((err) => this.log.warn("[discord-voice] check-ins preWarm error:", err?.message));
+        .catch((err) => this.log.warn(`[dv:${this.instanceId}] check-ins preWarm error:`, err?.message));
     }
   }
 }

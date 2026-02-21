@@ -104,7 +104,7 @@ export class VoiceManager {
     });
 
     this.client.on(Events.Error, (err) => {
-      this.log.error("[dv:${this.instanceId}] Discord client error:", err.message);
+      this.log.error(`[dv:${this.instanceId}] Discord client error:`, err.message);
     });
 
     // Commit 9: start health server if configured
@@ -119,7 +119,7 @@ export class VoiceManager {
     this.leaveChannel();
     metrics.stopHealthServer();
     this.client.destroy();
-    this.log.info("[dv:${this.instanceId}] Voice manager stopped");
+    this.log.info(`[dv:${this.instanceId}] Voice manager stopped`);
   }
 
   // ── Voice state tracking ────────────────────────────────────────
@@ -134,11 +134,11 @@ export class VoiceManager {
       const voiceChannel = channel as VoiceChannel;
       const member = voiceChannel.members.get(this.config.watchUserId);
       if (member) {
-        this.log.info("[dv:${this.instanceId}] User already in voice channel on startup — joining");
+        this.log.info(`[dv:${this.instanceId}] User already in voice channel on startup — joining`);
         await this.joinChannel(voiceChannel);
       }
     } catch (err: any) {
-      this.log.warn("[dv:${this.instanceId}] Could not check initial voice state:", err?.message);
+      this.log.warn(`[dv:${this.instanceId}] Could not check initial voice state:`, err?.message);
     }
   }
 
@@ -154,7 +154,7 @@ export class VoiceManager {
       if (this.userLeftTimer) {
         clearTimeout(this.userLeftTimer);
         this.userLeftTimer = null;
-        this.log.debug("[dv:${this.instanceId}] User rejoined — cancelled user-left timer");
+        this.log.debug(`[dv:${this.instanceId}] User rejoined — cancelled user-left timer`);
       }
       this.log.info(`[dv:${this.instanceId}] ${newState.member?.displayName ?? "User"} joined — following`);
       this.joinChannel(newState.channel as VoiceChannel);
@@ -166,7 +166,7 @@ export class VoiceManager {
       if (this.userLeftTimer) clearTimeout(this.userLeftTimer);
       this.userLeftTimer = setTimeout(() => {
         this.userLeftTimer = null;
-        this.log.info("[dv:${this.instanceId}] User-left grace expired — leaving channel");
+        this.log.info(`[dv:${this.instanceId}] User-left grace expired — leaving channel`);
         this.leaveChannel();
       }, this.resCfg.userLeftGraceSec * 1000);
     }
@@ -178,12 +178,12 @@ export class VoiceManager {
     if (!channel.guild) return;
 
     if (this.joining) {
-      this.log.debug("[dv:${this.instanceId}] Join already in progress — ignoring duplicate call");
+      this.log.debug(`[dv:${this.instanceId}] Join already in progress — ignoring duplicate call`);
       return;
     }
 
     if (getVoiceConnection(channel.guild.id)) {
-      this.log.debug("[dv:${this.instanceId}] Already in voice channel");
+      this.log.debug(`[dv:${this.instanceId}] Already in voice channel`);
       return;
     }
 
@@ -193,6 +193,7 @@ export class VoiceManager {
 
     // Commit 5/8: bot speech callback → update timestamp + heartbeat
     this.pipeline = new AudioPipeline(this.config, this.log, {
+      instanceId: this.instanceId,
       onBotSpeech: () => {
         this.lastBotSpeechAt = Date.now();
         this.heartbeat?.reportBotSpeech();
@@ -223,7 +224,7 @@ export class VoiceManager {
       this.connection.subscribe(this.pipeline.getPlayer());
 
       await entersState(this.connection, VoiceConnectionStatus.Ready, 15_000);
-      this.log.info("[dv:${this.instanceId}] Voice connection ready");
+      this.log.info(`[dv:${this.instanceId}] Voice connection ready`);
 
       // Commit 3: attach disconnect handler AFTER initial Ready — avoids
       // firing reconnect during the normal Connecting→Signalling→Ready sequence
@@ -311,7 +312,7 @@ export class VoiceManager {
     this.reconnecting = true;
 
     this.doReconnect().catch((err) => {
-      this.log.error("[dv:${this.instanceId}] Reconnect loop error:", err?.message);
+      this.log.error(`[dv:${this.instanceId}] Reconnect loop error:`, err?.message);
       this.leaveChannel();
     });
   }
@@ -351,7 +352,7 @@ export class VoiceManager {
         this.reconnecting = false;
 
         metrics.increment("voice.reconnect.success");
-        this.log.info("[dv:${this.instanceId}] Reconnected successfully");
+        this.log.info(`[dv:${this.instanceId}] Reconnected successfully`);
         return;
       } catch {
         // This attempt failed — try again
@@ -411,7 +412,7 @@ export class VoiceManager {
         this.pipeline.interrupt();
       }
 
-      this.log.debug("[dv:${this.instanceId}] Speech detected, capturing");
+      this.log.debug(`[dv:${this.instanceId}] Speech detected, capturing`);
 
       const stream = receiver.subscribe(userId, {
         end: {
@@ -450,7 +451,7 @@ export class VoiceManager {
 
           if (consecutiveDecodeFailures > OPUS_RESET_THRESHOLD) {
             this.log.warn(
-              "[dv:${this.instanceId}] Receive stream reset due to codec desync"
+              `[dv:${this.instanceId}] Receive stream reset due to codec desync`
             );
             stream.destroy();
             // Re-subscribe will happen on the next "start" event
@@ -473,7 +474,7 @@ export class VoiceManager {
       stream.once("error", (err) => {
         capturing = false;
         this.heartbeat?.setUserSpeaking(false);
-        this.log.error("[dv:${this.instanceId}] Audio stream error:", err.message);
+        this.log.error(`[dv:${this.instanceId}] Audio stream error:`, err.message);
       });
     };
 
@@ -497,7 +498,7 @@ export class VoiceManager {
     } else {
       // Cache miss — synthesise fallback
       this.pipeline.synthesiseAsync("Still there?").catch((err) => {
-        this.log.warn("[dv:${this.instanceId}] Silence prompt TTS error:", err?.message);
+        this.log.warn(`[dv:${this.instanceId}] Silence prompt TTS error:`, err?.message);
       });
     }
   }
@@ -507,7 +508,7 @@ export class VoiceManager {
     this.pipeline
       .synthesiseAsync("Hey, I'm gonna head out if nobody says anything.")
       .catch((err) => {
-        this.log.warn("[dv:${this.instanceId}] Grace announce TTS error:", err?.message);
+        this.log.warn(`[dv:${this.instanceId}] Grace announce TTS error:`, err?.message);
       });
   }
 
@@ -524,12 +525,12 @@ export class VoiceManager {
     if (!this.botStallRetried) {
       // First stall — interrupt and play recovery, then try reconnect
       this.botStallRetried = true;
-      this.log.info("[dv:${this.instanceId}] Retrying after stall — interrupting and reconnecting");
+      this.log.info(`[dv:${this.instanceId}] Retrying after stall — interrupting and reconnecting`);
       this.pipeline.interrupt();
       this.pipeline
         .synthesiseAsync("Having some trouble, one sec.")
         .catch((err: any) => {
-          this.log.warn("[dv:${this.instanceId}] Stall recovery TTS error:", err?.message);
+          this.log.warn(`[dv:${this.instanceId}] Stall recovery TTS error:`, err?.message);
         });
       if (this.connection) {
         this.handleDisconnect();
@@ -540,14 +541,14 @@ export class VoiceManager {
       this.pipeline
         .synthesiseAsync("Having some trouble, one sec.")
         .catch((err: any) => {
-          this.log.warn("[dv:${this.instanceId}] Stall recovery TTS error:", err?.message);
+          this.log.warn(`[dv:${this.instanceId}] Stall recovery TTS error:`, err?.message);
         });
     }
   }
 
   private handleAudioDesync(): void {
     if (!this.connection) return;
-    this.log.warn("[dv:${this.instanceId}] Audio desync detected — resetting receiver subscription");
+    this.log.warn(`[dv:${this.instanceId}] Audio desync detected — resetting receiver subscription`);
 
     // Destroy and re-subscribe by restarting the listener
     this.listening = false;
@@ -568,7 +569,7 @@ export class VoiceManager {
       });
       this.pipeline.getPlayer().play(resource);
     } catch (err: any) {
-      this.log.error("[dv:${this.instanceId}] playBuffer error:", err?.message);
+      this.log.error(`[dv:${this.instanceId}] playBuffer error:`, err?.message);
     }
   }
 }
