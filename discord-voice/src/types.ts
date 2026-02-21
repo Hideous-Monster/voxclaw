@@ -117,7 +117,7 @@ export const CONFIG_DEFAULTS: Partial<DiscordVoiceConfig> & {
     instructions: "Speak with a sharp, confident, slightly sardonic tone. You're direct and don't waste words — like a rock musician who happens to be brilliant at engineering. Warm underneath the edge, but never saccharine.",
   },
   vad: {
-    silenceThresholdMs: 800,
+    silenceThresholdMs: 500,
     minSpeechMs: 200,
     maxUtteranceSec: 120,
   },

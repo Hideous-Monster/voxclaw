@@ -54,6 +54,7 @@ export class VoiceManager {
   private guildId: string | null = null;
   private listening = false;
   private speakingHandler: ((userId: string) => void) | null = null;
+  private activeStreams = new Set<string>();
 
   // Commit 3: prevent concurrent reconnect loops
   private reconnecting = false;
@@ -386,21 +387,21 @@ export class VoiceManager {
     const decoder = new OpusEncoder(48_000, 2);
     const maxBytes = this.config.vad.maxUtteranceSec * BYTES_PER_SECOND;
 
-    let capturing = false;
-
     const handler = (userId: string) => {
       if (userId !== this.config.watchUserId) return;
-      if (capturing) {
-        const droppedUttId = `utt-${String(++this.uttCounter).padStart(3, "0")}`;
-        this.log.info(
-          JSON.stringify({ event: "UTTERANCE_DROPPED_CAPTURING", uttId: droppedUttId })
-        );
-        return;
-      }
 
       const uttId = `utt-${String(++this.uttCounter).padStart(3, "0")}`;
 
-      capturing = true;
+      if (this.activeStreams.has(userId)) {
+        this.log.info(JSON.stringify({
+          event: "UTTERANCE_DROPPED_ACTIVE_STREAM",
+          uttId,
+          userId,
+          instanceId: this.instanceId,
+        }));
+        return;
+      }
+      this.activeStreams.add(userId);
 
       // Commit 5: update speech timestamp + heartbeat
       this.lastUserSpeechAt = Date.now();
@@ -460,7 +461,7 @@ export class VoiceManager {
       });
 
       stream.once("end", () => {
-        capturing = false;
+        this.activeStreams.delete(userId);
         this.heartbeat?.setUserSpeaking(false);
 
         if (chunks.length === 0 || !this.pipeline) return;
@@ -472,7 +473,7 @@ export class VoiceManager {
       });
 
       stream.once("error", (err) => {
-        capturing = false;
+        this.activeStreams.delete(userId);
         this.heartbeat?.setUserSpeaking(false);
         this.log.error(`[dv:${this.instanceId}] Audio stream error:`, err.message);
       });

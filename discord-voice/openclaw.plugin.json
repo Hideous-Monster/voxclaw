@@ -69,7 +69,7 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "silenceThresholdMs": { "type": "number", "default": 800 },
+          "silenceThresholdMs": { "type": "number", "default": 500 },
           "minSpeechMs": { "type": "number", "default": 200 },
           "maxUtteranceSec": { "type": "number", "default": 120, "description": "Safety cap on single utterance length" }
         }
