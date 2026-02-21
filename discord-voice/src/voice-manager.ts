@@ -444,8 +444,12 @@ export class VoiceManager {
 
     const cached = ttsCache.getRandomGreeting("check-ins");
     if (cached) {
-      // Play the cached buffer directly through the player
-      this.playBuffer(cached);
+      // Play the cached buffer directly through the player.
+      // isOggOpus=true for baked disk phrases; false for in-memory MP3.
+      this.playBuffer(
+        cached.buffer,
+        cached.isOggOpus ? StreamType.OggOpus : StreamType.Arbitrary
+      );
     } else {
       // Cache miss — synthesise fallback
       this.pipeline.synthesiseAsync("Still there?").catch((err) => {
@@ -507,15 +511,16 @@ export class VoiceManager {
   }
 
   /**
-   * Play a raw MP3 buffer directly through the audio player.
+   * Play a raw audio buffer directly through the audio player.
    * Used for cached check-in phrases (we have the buffer but not the text).
+   * streamType defaults to Arbitrary (MP3); pass OggOpus for baked disk phrases.
    */
-  private playBuffer(mp3Buffer: Buffer): void {
+  private playBuffer(buffer: Buffer, streamType: StreamType = StreamType.Arbitrary): void {
     if (!this.pipeline) return;
 
     try {
-      const resource = createAudioResource(Readable.from(mp3Buffer), {
-        inputType: StreamType.Arbitrary,
+      const resource = createAudioResource(Readable.from(buffer), {
+        inputType: streamType,
       });
       this.pipeline.getPlayer().play(resource);
     } catch (err: any) {

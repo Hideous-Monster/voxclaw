@@ -82,6 +82,8 @@ export interface DiscordVoiceConfig {
       enabled?: boolean;
       maxSizeMb?: number;
       preWarmOnConnect?: boolean;
+      /** Override the directory where baked OGG phrase files are stored. */
+      bakedPhrasesDir?: string;
     };
   };
 
@@ -97,7 +99,7 @@ export const CONFIG_DEFAULTS: Partial<DiscordVoiceConfig> & {
   resilience: Required<NonNullable<DiscordVoiceConfig['resilience']>>;
   heartbeat: Required<NonNullable<DiscordVoiceConfig['heartbeat']>>;
   cache: Required<NonNullable<DiscordVoiceConfig['cache']>> & {
-    tts: Required<NonNullable<DiscordVoiceConfig['cache']>['tts']>;
+    tts: Required<Pick<NonNullable<NonNullable<DiscordVoiceConfig['cache']>['tts']>, 'enabled' | 'maxSizeMb' | 'preWarmOnConnect'>>;
   };
   observability: Required<Pick<NonNullable<DiscordVoiceConfig['observability']>, 'metricsLogIntervalSec'>>;
 } = {

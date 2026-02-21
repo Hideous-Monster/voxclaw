@@ -3,11 +3,13 @@
  *
  * Commit 6: LRU eviction, stats, random-greeting helpers.
  * Commit 7: preWarm from phrase files with concurrency=5 semaphore.
+ * Commit 8: Baked phrases persisted to disk as OGG Opus files.
  */
 
 import { createHash } from "crypto";
+import * as fs from "fs";
+import * as path from "path";
 import OpenAI from "openai";
-import { synthesise } from "./tts.js";
 import { DiscordVoiceConfig, Logger } from "./types.js";
 import { metrics } from "./metrics.js";
 
@@ -21,10 +23,48 @@ interface CacheEntry {
   size: number;
 }
 
+interface BakedManifest {
+  configHash: string;
+  entries: Record<string, string>; // filename → phrase text
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 function sha256(input: string): string {
   return createHash("sha256").update(input).digest("hex");
+}
+
+const OPENAI_TTS_MAX_CHARS = 4096;
+
+/**
+ * Synthesise text to an OGG Opus buffer (for disk baking).
+ * Uses response_format "opus" which returns an OGG Opus byte stream
+ * directly compatible with Discord/ffmpeg without transcoding.
+ */
+async function synthesiseBaked(
+  text: string,
+  config: DiscordVoiceConfig,
+  client: OpenAI,
+  log: Logger
+): Promise<Buffer> {
+  let input = text;
+  if (input.length > OPENAI_TTS_MAX_CHARS) {
+    log.warn(
+      `[discord-voice] TTS baked input too long (${input.length} chars), truncating to ${OPENAI_TTS_MAX_CHARS}`
+    );
+    input = input.slice(0, OPENAI_TTS_MAX_CHARS - 3) + "...";
+  }
+
+  const response = await client.audio.speech.create({
+    model: config.tts.model,
+    voice: config.tts.voice as any,
+    input,
+    response_format: "opus",
+    ...(config.tts.instructions && { instructions: config.tts.instructions }),
+  });
+
+  const arrayBuffer = await response.arrayBuffer();
+  return Buffer.from(arrayBuffer);
 }
 
 // ── TtsCache ────────────────────────────────────────────────────────
@@ -46,6 +86,12 @@ export class TtsCache {
 
   /** Hash of (provider+model+voice+instructions) — used for cache invalidation on re-warm. */
   private configHash = "";
+
+  /**
+   * Tracks which cache keys hold OGG Opus buffers (baked from disk).
+   * On-the-fly synthesised buffers are MP3 and NOT in this set.
+   */
+  private bakedOggKeys = new Set<string>();
 
   // ── Key generation ────────────────────────────────────────────────
 
@@ -69,6 +115,18 @@ export class TtsCache {
         instructions: config.tts.instructions ?? "",
       })
     ).slice(0, 16);
+  }
+
+  /** Returns true if the cached buffer for this key is an OGG Opus byte stream (baked). */
+  isBakedOgg(key: string): boolean {
+    return this.bakedOggKeys.has(key);
+  }
+
+  private getBakedDir(config: DiscordVoiceConfig): string {
+    return (
+      config.cache?.tts?.bakedPhrasesDir ??
+      path.resolve(__dirname, "../phrases/baked")
+    );
   }
 
   // ── Cache operations ──────────────────────────────────────────────
@@ -126,6 +184,7 @@ export class TtsCache {
     this.store.clear();
     this.totalBytes = 0;
     for (const set of this.labelKeys.values()) set.clear();
+    this.bakedOggKeys.clear();
     metrics.gauge("voice.tts.cache_size_bytes", 0);
   }
 
@@ -152,8 +211,9 @@ export class TtsCache {
    * Pick a random cached entry from the given phrase set.
    * Never returns the same key twice in a row.
    * Returns null if the set is empty or nothing is cached.
+   * `isOggOpus` is true when the buffer is a baked OGG Opus byte stream.
    */
-  getRandomGreeting(label: PhraseLabel): Buffer | null {
+  getRandomGreeting(label: PhraseLabel): { buffer: Buffer; isOggOpus: boolean } | null {
     const keySet = this.labelKeys.get(label);
     if (!keySet || keySet.size === 0) return null;
 
@@ -182,14 +242,19 @@ export class TtsCache {
     entry.lastUsed = Date.now();
     this.hits++;
     metrics.increment("voice.tts.cache_hits");
-    return entry.buffer;
+    return { buffer: entry.buffer, isOggOpus: this.bakedOggKeys.has(chosen) };
   }
 
   // ── Pre-warming ────────────────────────────────────────────────────
 
   /**
-   * Synthesise all phrases and cache them, with concurrency=5.
-   * If the voice config hash has changed since the last warm, clears first.
+   * Synthesise all phrases, persist them to disk as OGG Opus files, and
+   * cache them in memory. On subsequent startups, loads from disk if the
+   * voice config hash hasn't changed — no TTS API calls.
+   *
+   * Concurrency limit of 5 applies to synthesis. Disk writes are synchronous
+   * per phrase (write then continue). Partial bakes synthesise only the
+   * missing phrases.
    */
   async preWarm(
     phrases: string[],
@@ -206,30 +271,121 @@ export class TtsCache {
     this.configHash = newHash;
 
     const maxSizeMb = config.cache?.tts?.maxSizeMb ?? 50;
-    const concurrency = 5;
+    const bakedDir = this.getBakedDir(config);
+    const manifestPath = path.join(bakedDir, "manifest.json");
+
+    // Ensure baked dir exists
+    fs.mkdirSync(bakedDir, { recursive: true });
+
+    // ── Load manifest ────────────────────────────────────────────────
+    let manifest: BakedManifest = { configHash: "", entries: {} };
+    let manifestLoaded = false;
+    try {
+      const raw = fs.readFileSync(manifestPath, "utf8");
+      manifest = JSON.parse(raw) as BakedManifest;
+      manifestLoaded = true;
+    } catch {
+      // No manifest or corrupt — start fresh
+    }
+
+    const manifestValid = manifestLoaded && manifest.configHash === newHash;
+
+    // If stale (loaded but hash mismatch), wipe the baked directory
+    if (manifestLoaded && !manifestValid) {
+      log.info("[discord-voice] Baked phrases config changed — clearing baked files");
+      try {
+        for (const f of fs.readdirSync(bakedDir)) {
+          try {
+            fs.unlinkSync(path.join(bakedDir, f));
+          } catch (e: any) {
+            log.warn(`[discord-voice] Could not delete baked file ${f}: ${e?.message}`);
+          }
+        }
+      } catch (e: any) {
+        log.warn(`[discord-voice] Could not read baked dir for cleanup: ${e?.message}`);
+      }
+      manifest = { configHash: newHash, entries: {} };
+    } else if (!manifestLoaded) {
+      manifest = { configHash: newHash, entries: {} };
+    }
+
+    // ── Partition phrases into cached vs needs-synthesis ─────────────
+    const phraseFilename = (phrase: string): string => {
+      const hash = sha256(phrase).slice(0, 12);
+      return `${label}-${hash}.ogg`;
+    };
+
+    let diskLoaded = 0;
+    const toSynthesize: Array<{ phrase: string; filename: string }> = [];
+
+    for (const phrase of phrases) {
+      const filename = phraseFilename(phrase);
+      const filepath = path.join(bakedDir, filename);
+
+      if (manifestValid && manifest.entries[filename] === phrase) {
+        // Try loading from disk
+        try {
+          const buffer = fs.readFileSync(filepath);
+          const key = this.buildKey(config, phrase);
+          this.set(key, buffer, maxSizeMb);
+          this.bakedOggKeys.add(key);
+          this.registerPhraseKey(key, label);
+          diskLoaded++;
+        } catch (err: any) {
+          log.warn(
+            `[discord-voice] Baked file unreadable (${filename}): ${err?.message} — re-synthesising`
+          );
+          toSynthesize.push({ phrase, filename });
+        }
+      } else {
+        toSynthesize.push({ phrase, filename });
+      }
+    }
+
+    if (diskLoaded > 0) {
+      log.info(`[discord-voice] Loaded ${diskLoaded} baked phrases from disk (${label})`);
+    }
+
+    // ── Synthesise missing phrases with concurrency=5 ────────────────
     let index = 0;
-    let completed = 0;
+    let synthesised = 0;
     let errors = 0;
 
     const worker = async (): Promise<void> => {
       while (true) {
         const i = index++;
-        if (i >= phrases.length) break;
-        const phrase = phrases[i];
+        if (i >= toSynthesize.length) break;
+        const { phrase, filename } = toSynthesize[i];
         const key = this.buildKey(config, phrase);
 
-        // Skip if already cached
+        // Skip if already cached (e.g. from a parallel preWarm call)
         if (this.store.has(key)) {
           this.registerPhraseKey(key, label);
-          completed++;
+          this.bakedOggKeys.add(key);
+          manifest.entries[filename] = phrase;
+          synthesised++;
           continue;
         }
 
         try {
-          const buffer = await synthesise(phrase, config, client, log);
+          const buffer = await synthesiseBaked(phrase, config, client, log);
+
+          // Write to disk synchronously (write then continue)
+          const filepath = path.join(bakedDir, filename);
+          try {
+            fs.writeFileSync(filepath, buffer);
+            manifest.entries[filename] = phrase;
+          } catch (writeErr: any) {
+            log.warn(
+              `[discord-voice] Failed to write baked file (${filename}): ${writeErr?.message}`
+            );
+            // Still cache in memory even if disk write failed
+          }
+
           this.set(key, buffer, maxSizeMb);
+          this.bakedOggKeys.add(key);
           this.registerPhraseKey(key, label);
-          completed++;
+          synthesised++;
         } catch (err: any) {
           errors++;
           log.warn(
@@ -239,15 +395,28 @@ export class TtsCache {
       }
     };
 
-    // Spawn concurrency=5 workers
-    const workers: Promise<void>[] = [];
-    for (let w = 0; w < Math.min(concurrency, phrases.length); w++) {
-      workers.push(worker());
-    }
-    await Promise.all(workers);
+    if (toSynthesize.length > 0) {
+      const workers: Promise<void>[] = [];
+      for (let w = 0; w < Math.min(5, toSynthesize.length); w++) {
+        workers.push(worker());
+      }
+      await Promise.all(workers);
 
+      // Persist updated manifest
+      try {
+        fs.writeFileSync(
+          manifestPath,
+          JSON.stringify({ configHash: newHash, entries: manifest.entries }, null, 2)
+        );
+      } catch (err: any) {
+        log.warn(`[discord-voice] Failed to write baked manifest: ${err?.message}`);
+      }
+    }
+
+    const total = diskLoaded + synthesised;
     log.info(
-      `[discord-voice] Pre-warm complete (${label}): ${completed}/${phrases.length} cached` +
+      `[discord-voice] Pre-warm complete (${label}): ${total}/${phrases.length} cached` +
+        (synthesised > 0 ? `, ${synthesised} newly synthesised` : "") +
         (errors > 0 ? `, ${errors} errors` : "")
     );
   }

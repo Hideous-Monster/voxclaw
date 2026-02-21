@@ -41,7 +41,9 @@ export class AudioPipeline {
   private utteranceQueue: Buffer[] = [];
 
   // Audio chunks ready for playback (from TTS). Played sequentially.
-  private audioQueue: Buffer[] = [];
+  // Each entry carries a StreamType so OGG Opus baked buffers are decoded
+  // correctly (StreamType.OggOpus) vs on-the-fly MP3 (StreamType.Arbitrary).
+  private audioQueue: Array<{ buffer: Buffer; streamType: StreamType }> = [];
   private playingAudio = false;
 
   // Abort controller for the current streaming completion
@@ -250,7 +252,7 @@ export class AudioPipeline {
       }
     }
 
-    this.audioQueue.push(mp3Buffer);
+    this.audioQueue.push({ buffer: mp3Buffer, streamType: StreamType.Arbitrary });
 
     if (!this.playingAudio) {
       this.playNextAudioChunk();
@@ -260,8 +262,8 @@ export class AudioPipeline {
   }
 
   private playNextAudioChunk(): void {
-    const mp3 = this.audioQueue.shift();
-    if (!mp3) {
+    const entry = this.audioQueue.shift();
+    if (!entry) {
       this.playingAudio = false;
       return;
     }
@@ -277,8 +279,10 @@ export class AudioPipeline {
       this.e2eRecorded = true;
     }
 
-    const resource = createAudioResource(Readable.from(mp3), {
-      inputType: StreamType.Arbitrary,
+    // Baked OGG Opus buffers must use StreamType.OggOpus so @discordjs/voice
+    // does not try to re-decode them as raw PCM/Arbitrary.
+    const resource = createAudioResource(Readable.from(entry.buffer), {
+      inputType: entry.streamType,
     });
     this.player.play(resource);
   }
