@@ -420,7 +420,6 @@ export class TtsCache {
         (errors > 0 ? `, ${errors} errors` : "")
     );
   }
-}
 
 /** Global singleton. */
 export const ttsCache = new TtsCache();
