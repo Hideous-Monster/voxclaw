@@ -59,6 +59,8 @@ export interface DiscordVoiceConfig {
     minSpeechMs: number;
     /** Maximum single utterance duration in seconds (safety cap) */
     maxUtteranceSec: number;
+    /** When false, skip noise filtering entirely. Default: true */
+    noiseFilterEnabled?: boolean;
   };
 
   resilience?: {
@@ -120,6 +122,7 @@ export const CONFIG_DEFAULTS: Partial<DiscordVoiceConfig> & {
     silenceThresholdMs: 500,
     minSpeechMs: 200,
     maxUtteranceSec: 120,
+    noiseFilterEnabled: true,
   },
   resilience: {
     maxReconnectAttempts: 5,

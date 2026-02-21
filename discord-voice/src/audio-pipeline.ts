@@ -153,24 +153,26 @@ export class AudioPipeline {
         return;
       }
 
-      const NOISE_PATTERNS = [
-        /^(you|the|a|um|uh|hmm|oh|ah|bye|thank you|thanks)\.?$/i,
-        /^\W+$/,
-      ];
-      const wordCount = transcript.split(/\s+/).length;
-      const isNoise = wordCount <= 2 && NOISE_PATTERNS.some((p) => p.test(transcript));
-      if (isNoise) {
-        this.log.info(
-          JSON.stringify({
-            event: "UTTERANCE_FILTERED",
-            uttId,
-            reason: "noise",
-            transcript,
-          })
-        );
-        this.processing = false;
-        this.processNextUtterance();
-        return;
+      if (this.config.vad.noiseFilterEnabled !== false) {
+        const NOISE_PATTERNS = [
+          /^(um|uh|hmm|oh|ah|huh)\.?$/i,
+          /^\W+$/,
+        ];
+        const wordCount = transcript.split(/\s+/).length;
+        const isNoise = wordCount <= 2 && NOISE_PATTERNS.some((p) => p.test(transcript));
+        if (isNoise) {
+          this.log.info(
+            JSON.stringify({
+              event: "UTTERANCE_FILTERED",
+              uttId,
+              reason: "noise",
+              transcript,
+            })
+          );
+          this.processing = false;
+          this.processNextUtterance();
+          return;
+        }
       }
 
       this.log.info(`[dv:${this.instanceId}] 🎤 "${transcript}"`);
