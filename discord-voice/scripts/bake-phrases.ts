@@ -10,14 +10,10 @@ interface BakeConfig {
   instructions?: string;
 }
 
-interface ManifestEntry {
-  phrase: string;
-  filename: string;
-}
-
 interface Manifest {
   configHash: string;
-  entries: Record<string, ManifestEntry[]>;
+  // flat map: filename.ogg → phrase text (matches loadBakedOnly expectations)
+  entries: Record<string, string>;
 }
 
 const REPO_ROOT = path.dirname(path.dirname(__filename));
@@ -100,18 +96,19 @@ function isPhraseBaked(label: string, phrase: string, configHash: string, manife
   if (!manifest || manifest.configHash !== configHash) {
     return false;
   }
-  const entries = manifest.entries[label] || [];
-  return entries.some((e) => e.phrase === phrase);
+  // Check if any entry in the flat map matches this label+phrase
+  return Object.entries(manifest.entries).some(
+    ([filename, p]) => filename.startsWith(label + '-') && p === phrase
+  );
 }
 
 // Get filename from manifest or compute it
 function getPhraseFilename(label: string, phrase: string, manifest: Manifest | null): string {
   if (manifest) {
-    const entries = manifest.entries[label] || [];
-    const entry = entries.find((e) => e.phrase === phrase);
-    if (entry) {
-      return entry.filename;
-    }
+    const existing = Object.entries(manifest.entries).find(
+      ([filename, p]) => filename.startsWith(label + '-') && p === phrase
+    );
+    if (existing) return existing[0];
   }
   const hash = hashPhrase(phrase);
   return `${label}-${hash}.ogg`;
@@ -145,8 +142,6 @@ async function processPhrases(
     entries: {},
   };
 
-  results.entries[label] = results.entries[label] || [];
-
   console.log(`Baking ${label} (${phrases.length})...`);
 
   const concurrencyLimit = 5;
@@ -174,13 +169,8 @@ async function processPhrases(
         const filePath = path.join(BAKED_DIR, filename);
         fs.writeFileSync(filePath, buffer);
 
-        // Add to manifest
-        const existingIndex = results.entries[label].findIndex((e) => e.phrase === phrase);
-        if (existingIndex >= 0) {
-          results.entries[label][existingIndex] = { phrase, filename };
-        } else {
-          results.entries[label].push({ phrase, filename });
-        }
+        // Add to manifest (flat: filename → phrase)
+        results.entries[filename] = phrase;
 
         completed++;
         console.log(`[${completed}/${phrases.length}] saved ${filename}`);
@@ -235,8 +225,8 @@ async function main() {
     }
     fs.writeFileSync(MANIFEST_PATH, JSON.stringify(manifest, null, 2));
 
-    const greetingCount = manifest.entries.greetings?.length || 0;
-    const checkInCount = manifest.entries['check-ins']?.length || 0;
+    const greetingCount = Object.keys(manifest.entries).filter(f => f.startsWith('greetings-')).length;
+    const checkInCount = Object.keys(manifest.entries).filter(f => f.startsWith('check-ins-')).length;
     console.log(`Done. ${greetingCount} greetings + ${checkInCount} check-ins baked.`);
   } catch (error) {
     console.error('Error during baking:', error instanceof Error ? error.message : String(error));

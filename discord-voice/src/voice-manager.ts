@@ -224,7 +224,7 @@ export class VoiceManager {
 
       this.connection.subscribe(this.pipeline.getPlayer());
 
-      await entersState(this.connection, VoiceConnectionStatus.Ready, 15_000);
+      await entersState(this.connection, VoiceConnectionStatus.Ready, 30_000);
       this.log.info(`[dv:${this.instanceId}] Voice connection ready`);
 
       // Commit 3: attach disconnect handler AFTER initial Ready — avoids
@@ -264,7 +264,20 @@ export class VoiceManager {
       this.joining = false;
       this.log.error(`[dv:${this.instanceId}] Failed to join: ${err?.message ?? err} (${typeof err})`);
       if (err?.stack) this.log.error(`[dv:${this.instanceId}] Stack: ${err.stack}`);
-      this.leaveChannel();
+
+      // Destroy the failed connection and retry once after 8s before giving up
+      this.connection?.destroy();
+      this.connection = null;
+
+      this.log.warn(`[dv:${this.instanceId}] Retrying join in 8s...`);
+      setTimeout(() => {
+        if (!this.joining) {
+          this.joinChannel(channel).catch((retryErr) => {
+            this.log.error(`[dv:${this.instanceId}] Retry failed: ${retryErr?.message ?? retryErr} — giving up`);
+            this.leaveChannel();
+          });
+        }
+      }, 8_000);
     }
   }
 
@@ -460,9 +473,18 @@ export class VoiceManager {
         }
       });
 
-      stream.once("end", () => {
+      // Single cleanup path — called from end, close, or error so activeStreams
+      // is always released even if stream.destroy() is called (fires close, not end)
+      let streamCleaned = false;
+      const cleanupStream = () => {
+        if (streamCleaned) return;
+        streamCleaned = true;
         this.activeStreams.delete(userId);
         this.heartbeat?.setUserSpeaking(false);
+      };
+
+      stream.once("end", () => {
+        cleanupStream();
 
         if (chunks.length === 0 || !this.pipeline) return;
 
@@ -485,9 +507,10 @@ export class VoiceManager {
         this.pipeline.enqueue({ pcm, uttId });
       });
 
+      stream.once("close", cleanupStream);
+
       stream.once("error", (err) => {
-        this.activeStreams.delete(userId);
-        this.heartbeat?.setUserSpeaking(false);
+        cleanupStream();
         this.log.error(`[dv:${this.instanceId}] Audio stream error:`, err.message);
       });
     };
