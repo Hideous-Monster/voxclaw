@@ -473,9 +473,18 @@ export class VoiceManager {
         }
       });
 
-      stream.once("end", () => {
+      // Single cleanup path — called from end, close, or error so activeStreams
+      // is always released even if stream.destroy() is called (fires close, not end)
+      let streamCleaned = false;
+      const cleanupStream = () => {
+        if (streamCleaned) return;
+        streamCleaned = true;
         this.activeStreams.delete(userId);
         this.heartbeat?.setUserSpeaking(false);
+      };
+
+      stream.once("end", () => {
+        cleanupStream();
 
         if (chunks.length === 0 || !this.pipeline) return;
 
@@ -498,9 +507,10 @@ export class VoiceManager {
         this.pipeline.enqueue({ pcm, uttId });
       });
 
+      stream.once("close", cleanupStream);
+
       stream.once("error", (err) => {
-        this.activeStreams.delete(userId);
-        this.heartbeat?.setUserSpeaking(false);
+        cleanupStream();
         this.log.error(`[dv:${this.instanceId}] Audio stream error:`, err.message);
       });
     };
